@@ -5,7 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
-from .flow import call_span, direct_calls, forwards_parameter
+from .core import (
+    AnalysisContext,
+    ResolutionError,
+    call_span,
+    direct_calls,
+    forwards_parameter,
+    identity_from_target,
+)
 from .models import (
     AnalysisBoundary,
     FindingKind,
@@ -14,7 +21,6 @@ from .models import (
     SourceContext,
     VariadicFunction,
 )
-from .resolution import PCResolveAdapter, ResolutionError, identity_from_target
 from .source import SourceIndex, build_source_index
 
 PathLike = Union[str, Path]
@@ -48,7 +54,7 @@ def scan_package(
             findings=(),
             boundaries=(*index.boundaries, boundary),
         )
-    adapter = PCResolveAdapter(index)
+    context = AnalysisContext.from_index(index)
     variadic_functions: List[VariadicFunction] = []
     findings: List[ForwardingFinding] = []
     boundaries: List[AnalysisBoundary] = list(index.boundaries)
@@ -59,7 +65,7 @@ def scan_package(
             continue
         variadic_functions.append(VariadicFunction(function.identity, function.variadic_parameters))
         try:
-            analysis = adapter.analyze(function.identity, max_depth=1)
+            analysis = context.adapter.analyze(function.identity, max_depth=1)
         except ResolutionError as exc:
             boundaries.append(
                 AnalysisBoundary(

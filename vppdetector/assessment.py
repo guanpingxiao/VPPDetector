@@ -3,29 +3,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .flow import (
+from .core import (
+    AnalysisContext,
+    PCResolveAdapter,
+    ResolutionError,
     call_span,
     direct_calls,
     forwarding_is_conditional,
     forwards_parameter,
+    identity_from_target,
     parameter_reaches_call,
 )
 from .models import (
     AnalysisBoundary,
     ArgumentEffect,
-    ChangeKind,
     DownstreamSink,
     FunctionIdentity,
-    RepairAction,
+    SourceContext,
     VariadicKind,
     Verdict,
     VPPAssessment,
     VPPRequest,
 )
-from .resolution import PCResolveAdapter, ResolutionError, identity_from_target
-from .source import IndexedFunction, SourceIndex, build_source_index, parameter_is_mutated
+from .source import IndexedFunction, SourceIndex, parameter_is_mutated
 
 
 @dataclass(frozen=True)
@@ -47,16 +49,20 @@ class _FlowOutcome:
     dropped: int = 0
 
 
-def assess_change(request: VPPRequest) -> VPPAssessment:
+def assess_change(
+    request: VPPRequest,
+    *,
+    _context: Optional[AnalysisContext] = None,
+) -> VPPAssessment:
     """Assess one pre-detected delete/rename against the target implementation."""
 
-    index = build_source_index(request.source)
+    context = _context or AnalysisContext.from_source(request.source)
+    index = context.index
     function = index.find(request.target_api)
     if function is None:
         return _assessment(
             request,
             Verdict.UNKNOWN,
-            RepairAction.MANUAL_REVIEW,
             ArgumentEffect.UNKNOWN,
             "target_api_not_found",
             "The target API definition could not be selected uniquely.",
@@ -73,7 +79,6 @@ def assess_change(request: VPPRequest) -> VPPAssessment:
         return _assessment(
             request,
             Verdict.NOT_APPLICABLE,
-            RepairAction.NONE,
             ArgumentEffect.UNKNOWN,
             "capture_parameter_not_present",
             "The target signature does not contain the declared variadic capture.",
@@ -89,17 +94,15 @@ def assess_change(request: VPPRequest) -> VPPAssessment:
         return _assessment(
             request,
             Verdict.UNKNOWN,
-            RepairAction.MANUAL_REVIEW,
             ArgumentEffect.UNKNOWN,
             boundary.code,
             boundary.message,
             boundaries=(*index.boundaries, boundary),
         )
 
-    adapter = PCResolveAdapter(index)
     outcome, schema_version = _trace_keyword(
         index=index,
-        adapter=adapter,
+        adapter=context.adapter,
         entry=function,
         parameter=change.captured_by,
         old_name=change.old_name,
@@ -117,7 +120,6 @@ def assess_change(request: VPPRequest) -> VPPAssessment:
             return _assessment(
                 request,
                 Verdict.MAY_FAIL,
-                RepairAction.MANUAL_REVIEW,
                 ArgumentEffect.FORWARDED,
                 "path_dependent_downstream_rejection",
                 "The old keyword is rejected on at least one feasible forwarding path.",
@@ -125,11 +127,9 @@ def assess_change(request: VPPRequest) -> VPPAssessment:
                 boundaries=boundaries,
                 schema_version=schema_version,
             )
-        action = RepairAction.DELETE if change.kind is ChangeKind.DELETE else RepairAction.RENAME
         return _assessment(
             request,
             Verdict.MUST_FAIL,
-            action,
             ArgumentEffect.REJECTED,
             "downstream_rejects_old_keyword",
             "The old keyword reaches a fixed signature that cannot bind it.",
@@ -143,7 +143,6 @@ def assess_change(request: VPPRequest) -> VPPAssessment:
         return _assessment(
             request,
             Verdict.UNKNOWN,
-            RepairAction.MANUAL_REVIEW,
             ArgumentEffect.FORWARDED if outcome.sinks else ArgumentEffect.UNKNOWN,
             primary.code,
             primary.message,
@@ -156,7 +155,6 @@ def assess_change(request: VPPRequest) -> VPPAssessment:
         return _assessment(
             request,
             Verdict.SAFE,
-            RepairAction.PRESERVE,
             ArgumentEffect.ACCEPTED,
             "downstream_accepts_old_keyword",
             "Every terminal forwarding target explicitly accepts the old keyword.",
@@ -168,7 +166,6 @@ def assess_change(request: VPPRequest) -> VPPAssessment:
     return _assessment(
         request,
         Verdict.SAFE,
-        RepairAction.PRESERVE,
         ArgumentEffect.DROPPED,
         "old_argument_not_forwarded",
         "The captured old keyword is not expanded into a rejecting downstream call.",
@@ -179,9 +176,17 @@ def assess_change(request: VPPRequest) -> VPPAssessment:
 
 
 def assess_changes(requests: Iterable[VPPRequest]) -> Tuple[VPPAssessment, ...]:
-    """Convenience batch wrapper; it does not compare library versions."""
+    """Assess requests while reusing analysis state for each source version."""
 
-    return tuple(assess_change(request) for request in requests)
+    contexts: Dict[SourceContext, AnalysisContext] = {}
+    results = []
+    for request in requests:
+        context = contexts.get(request.source)
+        if context is None:
+            context = AnalysisContext.from_source(request.source)
+            contexts[request.source] = context
+        results.append(assess_change(request, _context=context))
+    return tuple(results)
 
 
 def _trace_keyword(
@@ -399,7 +404,6 @@ def _target_definition(
 def _assessment(
     request: VPPRequest,
     verdict: Verdict,
-    action: RepairAction,
     effect: ArgumentEffect,
     reason_code: str,
     message: str,
@@ -411,7 +415,6 @@ def _assessment(
     return VPPAssessment(
         request=request,
         verdict=verdict,
-        recommended_action=action,
         argument_effect=effect,
         reason_code=reason_code,
         message=message,

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vppdetector"
 version = "1.1.0"
-description = "Variadic-parameter propagation and compatibility analysis for Python"
+description = "Research scanner and PCART incubation code for variadic-parameter risks"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "AGPL-3.0-only"
@@ -15,9 +15,6 @@ dependencies = [
     "chardet>=3",
     "pcresolve>=1.0.6,<2",
 ]
-
-[project.scripts]
-vppdetector = "vppdetector.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["vppdetector*"]

@@ -33,14 +33,6 @@ class Verdict(StringEnum):
     NOT_APPLICABLE = "not_applicable"
 
 
-class RepairAction(StringEnum):
-    PRESERVE = "preserve"
-    DELETE = "delete"
-    RENAME = "rename"
-    MANUAL_REVIEW = "manual_review"
-    NONE = "none"
-
-
 class ArgumentEffect(StringEnum):
     ACCEPTED = "accepted"
     DROPPED = "dropped"
@@ -152,7 +144,6 @@ class DownstreamSink:
 class VPPAssessment:
     request: VPPRequest
     verdict: Verdict
-    recommended_action: RepairAction
     argument_effect: ArgumentEffect
     reason_code: str
     message: str

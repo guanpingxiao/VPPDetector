@@ -1,17 +1,23 @@
 # VPPDetector
 
-VPPDetector analyzes propagation of Python variadic parameters. Version 1.1
-introduces two core responsibilities:
+VPPDetector analyzes propagation of Python variadic parameters. The current
+repository is a research scanner and an incubation area for analysis that may
+later be integrated into PCART. It is not positioned as an
+independently published PyPI product.
+
+The code has two responsibilities:
 
 1. `scan_package()` scans one library version for latent variadic-parameter
    forwarding mismatches.
-2. `assess_change()` evaluates one already-detected parameter deletion or
-   rename against the target implementation.
+2. The internal `assess_change()` prototype analyzes one already-detected
+   parameter deletion or rename against the target implementation.
 
 VPPDetector does not compare every API in two library versions. API matching
 and parameter-change detection remain the responsibility of clients such as
-PCART. VPPDetector refines whether a change hidden by `*args` or `**kwargs`
-will be accepted by downstream calls.
+PCART. The scanner is the standalone workflow. Change-conditioned assessment
+is an internal analysis boundary intended to refine PCART's existing
+compatibility and repair pipeline rather than become another user-facing
+command.
 
 ## Requirements
 
@@ -24,7 +30,29 @@ Install the package in editable mode during development:
 python -m pip install -e .
 ```
 
-## Python API
+## Whole-package scan
+
+Scan one source version and print a JSON report:
+
+```shell
+python vppdetector.py /sources/example
+```
+
+Write the report to a file:
+
+```shell
+python vppdetector.py /sources/example --output report.json
+```
+
+Use repeated `--import-root` options when module names cannot be derived from
+the package root. On Windows, use the corresponding PowerShell line
+continuation syntax or enter the command on one line.
+
+The root script is intentionally a thin scan entry point. The original
+dataset-oriented implementation remains in `legacy_vppdetector.py` for
+research reproducibility.
+
+## Analysis API
 
 ### Single-version scan
 
@@ -40,7 +68,7 @@ The scanner uses PCResolve for exact cross-file call targets and records every
 forwarding call site independently. It supports functions, methods,
 `async def`, imports, and aliases covered by PCResolve.
 
-### Targeted change assessment
+### Internal change refinement
 
 ```python
 from pathlib import Path
@@ -67,11 +95,12 @@ request = VPPRequest(
 )
 
 assessment = assess_change(request)
-print(assessment.verdict, assessment.recommended_action)
+print(assessment.verdict, assessment.argument_effect)
 ```
 
-All in-process communication uses typed Python objects. JSON is only a CLI
-and report boundary.
+The assessment returns propagation effects, downstream evidence, and analysis
+boundaries. It deliberately does not select a delete, rename, or preserve
+repair action; that policy belongs to PCART.
 
 Current assessment support intentionally starts with direct `**kwargs`
 propagation and follows resolved `**kwargs` forwarding across multiple local
@@ -79,43 +108,14 @@ functions. Mutation of a propagated mapping, unresolved targets, indirect
 transformations, recursion/depth exhaustion, and element-level `*args`
 tracking produce explicit `unknown` results and analysis boundaries. The
 default forwarding depth is five and can be set on `VPPRequest.max_depth`.
-
-## Command line
-
-Scan one source version and print a JSON report:
-
-```shell
-vppdetector scan /sources/example
-```
-
-Write the report to a file:
-
-```shell
-vppdetector scan /sources/example --output report.json
-```
-
-Assess one known deletion:
-
-```shell
-vppdetector assess /sources/example \
-  --module example.api \
-  --qualname wrapper \
-  --change delete \
-  --old-name callback \
-  --captured-by kwargs \
-  --capture-kind var_keyword
-```
-
-Use repeated `--import-root` options when module names cannot be derived from
-the package root. On Windows, use the corresponding PowerShell line
-continuation syntax or enter the command on one line.
+`assess_changes()` reuses analysis state for requests against the same source
+version.
 
 ## Version 1.0 research scanner
 
-`python vppdetector.py` remains a compatibility entry point for the original
-dataset-oriented scanner. Its implementation is retained in
-`legacy_vppdetector.py`; it depends on PCART internals and contains
-dataset-specific paths. New integrations should use the package API.
+The original implementation is retained in `legacy_vppdetector.py`; it
+depends on PCART internals and contains dataset-specific paths. It is no longer
+the default `vppdetector.py` entry point.
 
 Historical outputs under `APIDefWithVariadicPara/` and
 `VariadicParaPitfalls/` are unchanged.

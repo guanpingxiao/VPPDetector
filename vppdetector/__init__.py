@@ -1,4 +1,4 @@
-"""Public Python API for VPPDetector."""
+"""Incubation API shared by the VPP scanner and compatibility refinement."""
 
 from .assessment import assess_change, assess_changes
 from .encoding import get_encoding, getEncoding
@@ -11,7 +11,6 @@ from .models import (
     ForwardingFinding,
     FunctionIdentity,
     ParameterChange,
-    RepairAction,
     ScanReport,
     SourceContext,
     VariadicKind,
@@ -30,7 +29,6 @@ __all__ = [
     "ForwardingFinding",
     "FunctionIdentity",
     "ParameterChange",
-    "RepairAction",
     "ScanReport",
     "SourceContext",
     "VPPAssessment",

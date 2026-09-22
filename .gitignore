@@ -13,3 +13,5 @@ tmp/
 
 # PCART-tools AGPL projects keep test suites local.
 /tests/
+/evaluation/
+/CHANGELOG.md
