@@ -20,15 +20,25 @@ class SignatureFacts:
     keyword_only: Tuple[str, ...]
     vararg: Optional[str]
     kwarg: Optional[str]
+    required_positional: Tuple[str, ...]
+    required_keyword_only: Tuple[str, ...]
 
     @classmethod
     def from_arguments(cls, arguments: ast.arguments) -> "SignatureFacts":
+        positional = (*arguments.posonlyargs, *arguments.args)
+        required_count = len(positional) - len(arguments.defaults)
         return cls(
             positional_only=tuple(arg.arg for arg in arguments.posonlyargs),
             positional_or_keyword=tuple(arg.arg for arg in arguments.args),
             keyword_only=tuple(arg.arg for arg in arguments.kwonlyargs),
             vararg=arguments.vararg.arg if arguments.vararg else None,
             kwarg=arguments.kwarg.arg if arguments.kwarg else None,
+            required_positional=tuple(arg.arg for arg in positional[:required_count]),
+            required_keyword_only=tuple(
+                arg.arg
+                for arg, default in zip(arguments.kwonlyargs, arguments.kw_defaults)
+                if default is None
+            ),
         )
 
     def accepts_keyword(self, name: str) -> bool:
@@ -49,6 +59,7 @@ class IndexedFunction:
     signature: SignatureFacts
     node: FunctionNode
     is_overload: bool
+    is_bound_method: bool = False
 
     @property
     def variadic_parameters(self) -> Tuple[Tuple[str, VariadicKind], ...]:
@@ -125,6 +136,7 @@ class _FunctionCollector(ast.NodeVisitor):
         self.module = module
         self.file_path = file_path
         self.scope: List[str] = []
+        self.scope_kinds: List[str] = []
         self.functions: List[IndexedFunction] = []
         self.constructors: List[IndexedConstructor] = []
 
@@ -160,11 +172,14 @@ class _FunctionCollector(ast.NodeVisitor):
                         signature=SignatureFacts.from_arguments(constructor.args),
                         node=constructor,
                         is_overload=False,
+                        is_bound_method=True,
                     ),
                 )
             )
         self.scope.append(node.name)
+        self.scope_kinds.append("class")
         self.generic_visit(node)
+        self.scope_kinds.pop()
         self.scope.pop()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -181,16 +196,23 @@ class _FunctionCollector(ast.NodeVisitor):
             file_path=self.file_path,
             lineno=node.lineno,
         )
+        is_direct_class_member = bool(self.scope_kinds and self.scope_kinds[-1] == "class")
+        is_static_method = any(
+            _decorator_name(item).split(".")[-1] == "staticmethod" for item in node.decorator_list
+        )
         self.functions.append(
             IndexedFunction(
                 identity=identity,
                 signature=SignatureFacts.from_arguments(node.args),
                 node=node,
                 is_overload=any(_is_overload_decorator(item) for item in node.decorator_list),
+                is_bound_method=is_direct_class_member and not is_static_method,
             )
         )
         self.scope.append(node.name)
+        self.scope_kinds.append("function")
         self.generic_visit(node)
+        self.scope_kinds.pop()
         self.scope.pop()
 
 

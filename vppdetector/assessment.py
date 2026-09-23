@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from .binding import bind_callsite
 from .core import (
     AnalysisContext,
     PCResolveAdapter,
@@ -16,10 +17,13 @@ from .core import (
     identity_from_target,
     parameter_reaches_call,
 )
+from .keyflow import KeyEffect, KeyPresence, analyze_mapping_key
 from .models import (
     AnalysisBoundary,
     ArgumentEffect,
+    BindingStatus,
     DownstreamSink,
+    EntryBinding,
     FunctionIdentity,
     SourceContext,
     VariadicKind,
@@ -27,7 +31,7 @@ from .models import (
     VPPAssessment,
     VPPRequest,
 )
-from .source import IndexedFunction, SourceIndex, parameter_is_mutated
+from .source import IndexedFunction, SourceIndex
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,8 @@ class _FlowOutcome:
     conditional_rejections: int = 0
     accepted: int = 0
     dropped: int = 0
+    consumed: int = 0
+    renamed: int = 0
 
 
 def assess_change(
@@ -85,6 +91,17 @@ def assess_change(
             boundaries=index.boundaries,
         )
 
+    entry_binding = None
+    if request.callsite is not None:
+        entry_binding = bind_callsite(request.callsite, function, change)
+        early = _assessment_from_entry_binding(
+            request=request,
+            binding=entry_binding,
+            boundaries=index.boundaries,
+        )
+        if early is not None:
+            return early
+
     if change.capture_kind is VariadicKind.POSITIONAL:
         boundary = AnalysisBoundary(
             code="positional_element_tracking_not_implemented",
@@ -98,6 +115,7 @@ def assess_change(
             boundary.code,
             boundary.message,
             boundaries=(*index.boundaries, boundary),
+            entry_binding=entry_binding,
         )
 
     outcome, schema_version = _trace_keyword(
@@ -126,6 +144,7 @@ def assess_change(
                 sinks=tuple(outcome.sinks),
                 boundaries=boundaries,
                 schema_version=schema_version,
+                entry_binding=entry_binding,
             )
         return _assessment(
             request,
@@ -136,6 +155,7 @@ def assess_change(
             sinks=tuple(outcome.sinks),
             boundaries=boundaries,
             schema_version=schema_version,
+            entry_binding=entry_binding,
         )
 
     if outcome.boundaries:
@@ -149,6 +169,7 @@ def assess_change(
             sinks=tuple(outcome.sinks),
             boundaries=boundaries,
             schema_version=schema_version,
+            entry_binding=entry_binding,
         )
 
     if outcome.accepted:
@@ -161,6 +182,33 @@ def assess_change(
             sinks=tuple(outcome.sinks),
             boundaries=boundaries,
             schema_version=schema_version,
+            entry_binding=entry_binding,
+        )
+
+    if outcome.renamed:
+        return _assessment(
+            request,
+            Verdict.SAFE,
+            ArgumentEffect.RENAMED,
+            "old_argument_renamed_locally",
+            "The captured old keyword is consumed and retained under another local key.",
+            sinks=tuple(outcome.sinks),
+            boundaries=boundaries,
+            schema_version=schema_version,
+            entry_binding=entry_binding,
+        )
+
+    if outcome.consumed:
+        return _assessment(
+            request,
+            Verdict.SAFE,
+            ArgumentEffect.CONSUMED,
+            "old_argument_consumed_locally",
+            "The captured old keyword is consumed before downstream variadic forwarding.",
+            sinks=tuple(outcome.sinks),
+            boundaries=boundaries,
+            schema_version=schema_version,
+            entry_binding=entry_binding,
         )
 
     return _assessment(
@@ -172,7 +220,88 @@ def assess_change(
         sinks=tuple(outcome.sinks),
         boundaries=boundaries,
         schema_version=schema_version,
+        entry_binding=entry_binding,
     )
+
+
+def _assessment_from_entry_binding(
+    *,
+    request: VPPRequest,
+    binding: EntryBinding,
+    boundaries: Sequence[AnalysisBoundary],
+) -> Optional[VPPAssessment]:
+    if binding.status is BindingStatus.NOT_EXERCISED:
+        return _assessment(
+            request,
+            Verdict.NOT_APPLICABLE,
+            ArgumentEffect.UNKNOWN,
+            binding.reason_code,
+            "The concrete call does not pass the changed argument.",
+            boundaries=boundaries,
+            entry_binding=binding,
+        )
+    if binding.status is BindingStatus.UNKNOWN:
+        boundary = AnalysisBoundary(
+            code=binding.reason_code,
+            message="The concrete call could not be bound conclusively to the new signature.",
+            function=request.target_api,
+        )
+        return _assessment(
+            request,
+            Verdict.UNKNOWN,
+            ArgumentEffect.UNKNOWN,
+            boundary.code,
+            boundary.message,
+            boundaries=(*boundaries, boundary),
+            entry_binding=binding,
+        )
+    if binding.status is BindingStatus.INVALID:
+        replacement = request.change.new_name
+        missing_replacement = bool(replacement and replacement in binding.missing_required)
+        captured_old_name = binding.changed_argument_target == request.change.captured_by
+        if missing_replacement and captured_old_name:
+            return _assessment(
+                request,
+                Verdict.MUST_FAIL,
+                ArgumentEffect.REJECTED,
+                "renamed_parameter_unbound",
+                (
+                    "The old keyword is captured variadically while its required "
+                    "replacement remains unbound."
+                ),
+                boundaries=boundaries,
+                entry_binding=binding,
+            )
+        boundary = AnalysisBoundary(
+            code=binding.reason_code,
+            message=(
+                "The concrete call is invalid for a reason not proven to be caused by this change."
+            ),
+            function=request.target_api,
+        )
+        return _assessment(
+            request,
+            Verdict.UNKNOWN,
+            ArgumentEffect.UNKNOWN,
+            boundary.code,
+            boundary.message,
+            boundaries=(*boundaries, boundary),
+            entry_binding=binding,
+        )
+    if binding.changed_argument_target != request.change.captured_by:
+        return _assessment(
+            request,
+            Verdict.NOT_APPLICABLE,
+            ArgumentEffect.UNKNOWN,
+            "changed_argument_not_variadically_captured",
+            (
+                "The concrete call binds the changed argument without using the "
+                "declared variadic capture."
+            ),
+            boundaries=boundaries,
+            entry_binding=binding,
+        )
+    return None
 
 
 def assess_changes(requests: Iterable[VPPRequest]) -> Tuple[VPPAssessment, ...]:
@@ -221,16 +350,6 @@ def _trace_keyword(
             )
             continue
 
-        if parameter_is_mutated(state.function, state.parameter):
-            outcome.boundaries.append(
-                AnalysisBoundary(
-                    code="variadic_capture_mutated",
-                    message="A propagated **kwargs mapping is mutated before or during forwarding.",
-                    function=identity,
-                )
-            )
-            continue
-
         try:
             analysis = adapter.analyze(identity, max_depth=1)
         except ResolutionError as exc:
@@ -243,6 +362,15 @@ def _trace_keyword(
             )
             continue
         schema_version = analysis.schema_version
+        key_flow = analyze_mapping_key(state.function, state.parameter, old_name)
+        if key_flow.raised_paths:
+            outcome.boundaries.append(
+                AnalysisBoundary(
+                    code="mapping_control_flow_may_raise",
+                    message="The analyzed function has a reachable raise or assertion path.",
+                    function=identity,
+                )
+            )
         expanded = False
         indirect = False
         relevant_call_ids = set()
@@ -251,11 +379,41 @@ def _trace_keyword(
             if not parameter_reaches_call(call, state.parameter):
                 continue
             relevant_call_ids.add(call.id)
+            span = call_span(call)
+            if key_flow.is_recognized_mutation(span):
+                continue
             if not forwards_parameter(call, state.parameter, VariadicKind.KEYWORD):
                 indirect = True
                 continue
             expanded = True
-            conditional = state.conditional or forwarding_is_conditional(call, state.parameter)
+            presences = key_flow.presence_at(span)
+            if not presences:
+                if key_flow.recognized_mutations or key_flow.terminal_effects:
+                    presences = frozenset({KeyPresence.UNKNOWN})
+                else:
+                    presences = frozenset({KeyPresence.PRESENT})
+            if presences == frozenset({KeyPresence.ABSENT}):
+                outcome.dropped += 1
+                continue
+            conditional_presence = KeyPresence.ABSENT in presences
+            if conditional_presence:
+                outcome.dropped += 1
+            if KeyPresence.UNKNOWN in presences:
+                outcome.boundaries.append(
+                    AnalysisBoundary(
+                        code="mapping_key_state_unknown",
+                        message="The old keyword's presence at a forwarding call is uncertain.",
+                        function=identity,
+                        callsite=span,
+                    )
+                )
+            conditional = (
+                state.conditional
+                or conditional_presence
+                or KeyPresence.UNKNOWN in presences
+                or key_flow.is_exception_guarded(span)
+                or forwarding_is_conditional(call, state.parameter)
+            )
             target_identity = identity_from_target(call.target) if call.target else None
             target_definition = _target_definition(index, target_identity)
 
@@ -357,6 +515,18 @@ def _trace_keyword(
             )
         if not expanded and not indirect:
             outcome.dropped += 1
+        if any(terminal.presence is KeyPresence.UNKNOWN for terminal in key_flow.terminal_states):
+            outcome.boundaries.append(
+                AnalysisBoundary(
+                    code="mapping_key_state_unknown",
+                    message="The old keyword's final mapping state is uncertain.",
+                    function=identity,
+                )
+            )
+        if key_flow.every_terminal_has(KeyEffect.RENAMED):
+            outcome.renamed += 1
+        elif key_flow.every_terminal_has(KeyEffect.CONSUMED):
+            outcome.consumed += 1
 
     return outcome, schema_version
 
@@ -411,6 +581,7 @@ def _assessment(
     sinks: Tuple[DownstreamSink, ...] = (),
     boundaries: Sequence[AnalysisBoundary] = (),
     schema_version: Optional[str] = None,
+    entry_binding: Optional[EntryBinding] = None,
 ) -> VPPAssessment:
     return VPPAssessment(
         request=request,
@@ -421,4 +592,5 @@ def _assessment(
         sinks=sinks,
         boundaries=tuple(boundaries),
         analyzer_schema_version=schema_version,
+        entry_binding=entry_binding,
     )

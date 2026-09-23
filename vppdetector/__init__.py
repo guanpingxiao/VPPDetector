@@ -5,8 +5,10 @@ from .encoding import get_encoding, getEncoding
 from .models import (
     AnalysisBoundary,
     ArgumentEffect,
+    BindingStatus,
     CallSite,
     ChangeKind,
+    EntryBinding,
     FindingKind,
     ForwardingFinding,
     FunctionIdentity,
@@ -23,8 +25,10 @@ from .scanner import scan_package
 __all__ = [
     "AnalysisBoundary",
     "ArgumentEffect",
+    "BindingStatus",
     "CallSite",
     "ChangeKind",
+    "EntryBinding",
     "FindingKind",
     "ForwardingFinding",
     "FunctionIdentity",

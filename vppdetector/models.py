@@ -35,10 +35,19 @@ class Verdict(StringEnum):
 
 class ArgumentEffect(StringEnum):
     ACCEPTED = "accepted"
+    CONSUMED = "consumed"
     DROPPED = "dropped"
     FORWARDED = "forwarded"
+    RENAMED = "renamed"
     REJECTED = "rejected"
     UNKNOWN = "unknown"
+
+
+class BindingStatus(StringEnum):
+    VALID = "valid"
+    INVALID = "invalid"
+    UNKNOWN = "unknown"
+    NOT_EXERCISED = "not_exercised"
 
 
 class FindingKind(StringEnum):
@@ -131,6 +140,20 @@ class AnalysisBoundary:
 
 
 @dataclass(frozen=True)
+class EntryBinding:
+    """Syntactic binding facts for one concrete client call."""
+
+    status: BindingStatus
+    reason_code: str
+    changed_argument_target: Optional[str] = None
+    missing_required: Tuple[str, ...] = field(default_factory=tuple)
+    duplicate_parameters: Tuple[str, ...] = field(default_factory=tuple)
+    unexpected_keywords: Tuple[str, ...] = field(default_factory=tuple)
+    dynamic_positional: bool = False
+    dynamic_keywords: bool = False
+
+
+@dataclass(frozen=True)
 class DownstreamSink:
     callee_expression: str
     callsite: SourceSpan
@@ -150,6 +173,7 @@ class VPPAssessment:
     sinks: Tuple[DownstreamSink, ...] = field(default_factory=tuple)
     boundaries: Tuple[AnalysisBoundary, ...] = field(default_factory=tuple)
     analyzer_schema_version: Optional[str] = None
+    entry_binding: Optional[EntryBinding] = None
 
 
 @dataclass(frozen=True)
