@@ -32,6 +32,8 @@ from .models import (
     VPPAssessment,
     VPPRequest,
 )
+from .positional import prove_direct_positional_forwarding
+from .property_validation import find_property_validation_path
 from .source import IndexedFunction, SourceIndex
 
 
@@ -54,6 +56,7 @@ class _FlowOutcome:
     dropped: int = 0
     consumed: int = 0
     renamed: int = 0
+    independent_raise: bool = False
 
 
 def assess_change(
@@ -104,9 +107,41 @@ def assess_change(
             return early
 
     if change.capture_kind is VariadicKind.POSITIONAL:
+        proof = prove_direct_positional_forwarding(request, function, index, context.adapter)
+        if proof is not None:
+            rejecting = proof.rejects
+            return _assessment(
+                request,
+                Verdict.MUST_FAIL if rejecting else Verdict.SAFE,
+                ArgumentEffect.REJECTED if rejecting else ArgumentEffect.ACCEPTED,
+                "direct_positional_target_rejects"
+                if rejecting
+                else "direct_positional_target_accepts",
+                (
+                    "The changed positional element reaches a fixed downstream signature "
+                    "that rejects it."
+                    if rejecting
+                    else "The complete direct positional forwarding binds to the fixed "
+                    "downstream signature."
+                ),
+                sinks=(
+                    DownstreamSink(
+                        callee_expression=proof.target.identity.qualname,
+                        callsite=proof.callsite,
+                        target=proof.target.identity,
+                        accepts_changed_argument=not rejecting,
+                        reason_code="direct_positional_binding",
+                    ),
+                ),
+                boundaries=index.boundaries,
+                entry_binding=entry_binding,
+            )
         boundary = AnalysisBoundary(
             code="positional_element_tracking_not_implemented",
-            message="Element-level *args assessment requires a concrete positional binding model.",
+            message=(
+                "Positional element tracking is available only for concrete, direct "
+                "forwarding to a uniquely resolved fixed signature."
+            ),
             function=function.identity,
         )
         return _assessment(
@@ -154,6 +189,33 @@ def assess_change(
             "downstream_rejects_old_keyword",
             "The old keyword reaches a fixed signature that cannot bind it.",
             sinks=tuple(outcome.sinks),
+            boundaries=boundaries,
+            schema_version=schema_version,
+            entry_binding=entry_binding,
+        )
+
+    property_path = find_property_validation_path(function, index, change.old_name)
+    if property_path is not None:
+        return _assessment(
+            request,
+            Verdict.MAY_FAIL,
+            ArgumentEffect.FORWARDED,
+            "downstream_property_validation_may_reject",
+            (
+                "The old keyword can reach a property validator without a matching setter. "
+                "Dynamic dispatch or an earlier exception may alter this path."
+            ),
+            sinks=(
+                *outcome.sinks,
+                DownstreamSink(
+                    callee_expression="self._internal_update",
+                    callsite=property_path.callsite,
+                    target=property_path.validator.identity,
+                    accepts_changed_argument=False,
+                    reason_code="missing_property_setter",
+                    conditional=True,
+                ),
+            ),
             boundaries=boundaries,
             schema_version=schema_version,
             entry_binding=entry_binding,
@@ -369,6 +431,15 @@ def _trace_keyword(
             old_name,
             mapping_effects=tuple(mapping_effects(analysis, identity)),
         )
+        outcome.independent_raise |= key_flow.independent_raised_paths
+        if not key_flow.terminal_states and not key_flow.raised_paths:
+            outcome.boundaries.append(
+                AnalysisBoundary(
+                    code="no_normal_return_path",
+                    message="No normal return path was established for this function.",
+                    function=identity,
+                )
+            )
         if key_flow.raised_paths:
             outcome.boundaries.append(
                 AnalysisBoundary(
@@ -548,6 +619,17 @@ def _trace_keyword(
         elif key_flow.every_terminal_has(KeyEffect.CONSUMED):
             outcome.consumed += 1
 
+    if outcome.rejected and outcome.independent_raise:
+        outcome.boundaries.append(
+            AnalysisBoundary(
+                code="independent_exception_before_rejection",
+                message=(
+                    "An unrelated exception can occur before the changed keyword reaches "
+                    "the rejecting downstream call."
+                ),
+                function=entry.identity,
+            )
+        )
     return outcome, schema_version
 
 

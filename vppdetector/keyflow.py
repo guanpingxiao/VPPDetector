@@ -41,6 +41,8 @@ class MappingKeyFlow:
     exception_guarded_calls: Set[Tuple[int, int, int, int]] = field(default_factory=set)
     terminal_states: Set[_State] = field(default_factory=set)
     raised_paths: bool = False
+    independent_raised_paths: bool = False
+    key_dependent_names: FrozenSet[str] = frozenset()
 
     def presence_at(self, span: SourceSpan) -> FrozenSet[KeyPresence]:
         states = self.call_states.get(_span_key(span), set())
@@ -81,6 +83,7 @@ def analyze_mapping_key(
         parameter=parameter,
         mutable_aliases=_mutable_alias_names(function.node, parameter, frozenset(operations)),
         pcresolve_operations=operations,
+        key_dependent_names=_key_dependent_names(function.node, parameter, key),
     )
     initial = {_State(KeyPresence.PRESENT)}
     remaining = _walk_block(
@@ -89,6 +92,7 @@ def analyze_mapping_key(
         parameter=parameter,
         key=key,
         result=result,
+        exception_guard_relevant=None,
     )
     result.terminal_states.update(remaining)
     return result
@@ -101,6 +105,7 @@ def _walk_block(
     parameter: str,
     key: str,
     result: MappingKeyFlow,
+    exception_guard_relevant: Optional[bool],
 ) -> Set[_State]:
     current = set(states)
     for statement in statements:
@@ -118,12 +123,18 @@ def _walk_block(
                 result=result,
             )
             true_states, false_states = _refine_membership(current, statement.test, parameter, key)
+            branch_guard_relevant = (
+                exception_guard_relevant is True
+            ) or _expression_references_key(
+                statement.test, parameter, key, result.key_dependent_names
+            )
             body_states = _walk_block(
                 statement.body,
                 true_states,
                 parameter=parameter,
                 key=key,
                 result=result,
+                exception_guard_relevant=branch_guard_relevant,
             )
             else_states = _walk_block(
                 statement.orelse,
@@ -131,6 +142,7 @@ def _walk_block(
                 parameter=parameter,
                 key=key,
                 result=result,
+                exception_guard_relevant=branch_guard_relevant,
             )
             current = body_states | else_states
             continue
@@ -145,9 +157,23 @@ def _walk_block(
                     key=key,
                     result=result,
                 )
-            result.terminal_states.update(current)
             if isinstance(statement, ast.Raise):
-                result.raised_paths = True
+                relevant_raise = (
+                    exception_guard_relevant is not False
+                    or _expression_references_key(
+                        statement,
+                        parameter,
+                        key,
+                        result.key_dependent_names,
+                    )
+                )
+                if relevant_raise:
+                    result.raised_paths = True
+                    result.terminal_states.update(current)
+                else:
+                    result.independent_raised_paths = True
+            else:
+                result.terminal_states.update(current)
             current = set()
             continue
         if isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
@@ -155,12 +181,16 @@ def _walk_block(
             if _has_loop_exit(statement) and _references_parameter(statement, parameter):
                 current = _set_presence(current, KeyPresence.UNKNOWN, None)
             _record_calls(header, current, result)
+            loop_guard_relevant = (exception_guard_relevant is True) or _expression_references_key(
+                header, parameter, key, result.key_dependent_names
+            )
             body_states = _walk_block(
                 statement.body,
                 set(current),
                 parameter=parameter,
                 key=key,
                 result=result,
+                exception_guard_relevant=loop_guard_relevant,
             )
             current |= body_states
             current = _walk_block(
@@ -169,6 +199,7 @@ def _walk_block(
                 parameter=parameter,
                 key=key,
                 result=result,
+                exception_guard_relevant=exception_guard_relevant,
             )
             continue
         if isinstance(statement, ast.Try):
@@ -185,6 +216,7 @@ def _walk_block(
                 parameter=parameter,
                 key=key,
                 result=result,
+                exception_guard_relevant=exception_guard_relevant,
             )
             handler_states = set()
             for handler in statement.handlers:
@@ -194,6 +226,13 @@ def _walk_block(
                     parameter=parameter,
                     key=key,
                     result=result,
+                    exception_guard_relevant=(exception_guard_relevant is True)
+                    or _expression_references_key(
+                        statement.body[0] if statement.body else statement,
+                        parameter,
+                        key,
+                        result.key_dependent_names,
+                    ),
                 )
             current = body_states | handler_states
             current = _walk_block(
@@ -202,6 +241,7 @@ def _walk_block(
                 parameter=parameter,
                 key=key,
                 result=result,
+                exception_guard_relevant=exception_guard_relevant,
             )
             current = _walk_block(
                 statement.finalbody,
@@ -209,6 +249,7 @@ def _walk_block(
                 parameter=parameter,
                 key=key,
                 result=result,
+                exception_guard_relevant=exception_guard_relevant,
             )
             continue
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -217,7 +258,10 @@ def _walk_block(
             _record_calls(statement, current, result)
             if _references_parameter(statement, parameter):
                 current = _set_presence(current, KeyPresence.UNKNOWN, None)
-            result.raised_paths = True
+            if exception_guard_relevant is True or _expression_references_key(
+                statement.test, parameter, key, result.key_dependent_names
+            ):
+                result.raised_paths = True
             continue
         if isinstance(statement, (ast.With, ast.AsyncWith)) or (
             hasattr(ast, "Match") and isinstance(statement, ast.Match)
@@ -391,6 +435,77 @@ def _may_raise_on_key_read(
     return reads_key and (
         any(state.presence is not KeyPresence.PRESENT for state in states)
         or _pops_key(node, parameter, key)
+    )
+
+
+def _key_dependent_names(function: ast.AST, parameter: str, key: str) -> FrozenSet[str]:
+    """Over-approximate locals derived from the tracked keyword."""
+
+    assignments = []
+    for node in _descendants(function):
+        if isinstance(node, ast.Assign):
+            assignments.append((node.targets, node.value))
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            assignments.append(((node.target,), node.value))
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            assignments.append(((node.target,), node.iter))
+    dependent = set()
+    changed = True
+    while changed:
+        changed = False
+        for targets, value in assignments:
+            if not _expression_references_key(value, parameter, key, frozenset(dependent)):
+                continue
+            names = {
+                child.id
+                for target in targets
+                for child in _descendants(target)
+                if isinstance(child, ast.Name)
+            }
+            if not names.issubset(dependent):
+                dependent.update(names)
+                changed = True
+    return frozenset(dependent)
+
+
+def _expression_references_key(
+    node: ast.AST,
+    parameter: str,
+    key: str,
+    dependent_names: FrozenSet[str],
+) -> bool:
+    """Keep unrelated literal-key lookups out of exception guards."""
+
+    if isinstance(node, ast.Name):
+        return node.id == parameter or node.id in dependent_names
+    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+        if node.value.id == parameter:
+            literal = _literal_string(node.slice)
+            return literal is None or literal == key
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        receiver = node.func.value
+        if (
+            isinstance(receiver, ast.Name)
+            and receiver.id == parameter
+            and node.func.attr in {"get", "pop", "setdefault"}
+            and node.args
+        ):
+            literal = _literal_string(node.args[0])
+            if literal is not None and literal != key:
+                return any(
+                    _expression_references_key(argument, parameter, key, dependent_names)
+                    for argument in (*node.args[1:], *(item.value for item in node.keywords))
+                )
+    if isinstance(node, ast.Compare) and len(node.ops) == len(node.comparators) == 1:
+        if isinstance(node.ops[0], (ast.In, ast.NotIn)):
+            comparator = node.comparators[0]
+            if isinstance(comparator, ast.Name) and comparator.id == parameter:
+                literal = _literal_string(node.left)
+                if literal is not None and literal != key:
+                    return False
+    return any(
+        _expression_references_key(child, parameter, key, dependent_names)
+        for child in ast.iter_child_nodes(node)
     )
 
 
