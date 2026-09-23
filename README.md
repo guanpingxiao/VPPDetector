@@ -104,12 +104,16 @@ repair action; that policy belongs to PCART.
 
 Current assessment support intentionally starts with direct `**kwargs`
 propagation and follows resolved `**kwargs` forwarding across multiple local
-functions. Mutation of a propagated mapping, unresolved targets, indirect
-transformations, recursion/depth exhaustion, and element-level `*args`
-tracking produce explicit `unknown` results and analysis boundaries. The
-default forwarding depth is five and can be set on `VPPRequest.max_depth`.
-`assess_changes()` reuses analysis state for requests against the same source
-version.
+functions. For a concrete call site, a narrow guard proof can also identify
+when the changed keyword is the sole captured key and a known `None` argument
+causes an uncaught, first-statement `if ... and kwargs: raise` branch. It
+supports direct calls and side-effect-free direct forwarding; uncertain values,
+other captured keys, and dynamic or conditional forwarding remain conservative.
+Unresolved targets, unsupported transformations, recursion/depth exhaustion,
+and most element-level `*args` tracking produce explicit `unknown` results and
+analysis boundaries. The default forwarding depth is five and can be set on
+`VPPRequest.max_depth`. `assess_changes()` reuses analysis state for requests
+against the same source version.
 
 ## Version 1.0 research scanner
 

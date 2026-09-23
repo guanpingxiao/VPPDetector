@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .binding import bind_callsite
+from .conditional import (
+    ConcreteCall,
+    entry_call_facts,
+    forwarded_call_facts,
+    proven_guard_rejection,
+)
 from .core import (
     AnalysisContext,
     PCResolveAdapter,
@@ -23,10 +30,12 @@ from .models import (
     AnalysisBoundary,
     ArgumentEffect,
     BindingStatus,
+    CallSite,
     DownstreamSink,
     EntryBinding,
     FunctionIdentity,
     SourceContext,
+    SourceSpan,
     VariadicKind,
     Verdict,
     VPPAssessment,
@@ -44,6 +53,7 @@ class _FlowState:
     depth: int
     conditional: bool = False
     ancestry: Tuple[Tuple[str, str, int, str], ...] = ()
+    concrete: Optional[ConcreteCall] = None
 
 
 @dataclass
@@ -51,6 +61,7 @@ class _FlowOutcome:
     sinks: List[DownstreamSink] = field(default_factory=list)
     boundaries: List[AnalysisBoundary] = field(default_factory=list)
     rejected: int = 0
+    guard_rejected: int = 0
     conditional_rejections: int = 0
     accepted: int = 0
     dropped: int = 0
@@ -161,6 +172,7 @@ def assess_change(
         parameter=change.captured_by,
         old_name=change.old_name,
         max_depth=request.max_depth,
+        callsite=request.callsite,
     )
     boundaries = (*index.boundaries, *outcome.boundaries)
 
@@ -186,8 +198,17 @@ def assess_change(
             request,
             Verdict.MUST_FAIL,
             ArgumentEffect.REJECTED,
-            "downstream_rejects_old_keyword",
-            "The old keyword reaches a fixed signature that cannot bind it.",
+            (
+                "conditional_guard_rejects_old_keyword"
+                if outcome.guard_rejected == outcome.rejected
+                else "downstream_rejects_old_keyword"
+            ),
+            (
+                "The concrete old keyword makes a downstream guard raise; removing it "
+                "makes that guard false."
+                if outcome.guard_rejected == outcome.rejected
+                else "The old keyword reaches a fixed signature that cannot bind it."
+            ),
             sinks=tuple(outcome.sinks),
             boundaries=boundaries,
             schema_version=schema_version,
@@ -389,9 +410,17 @@ def _trace_keyword(
     parameter: str,
     old_name: str,
     max_depth: int,
+    callsite: Optional[CallSite],
 ) -> Tuple[_FlowOutcome, Optional[str]]:
     outcome = _FlowOutcome()
-    pending = [_FlowState(entry, parameter, 0)]
+    pending = [
+        _FlowState(
+            entry,
+            parameter,
+            0,
+            concrete=entry_call_facts(callsite, entry, old_name),
+        )
+    ]
     schema_version: Optional[str] = None
 
     while pending:
@@ -425,6 +454,23 @@ def _trace_keyword(
             )
             continue
         schema_version = analysis.schema_version
+        guard = proven_guard_rejection(state.function, state.parameter, state.concrete)
+        if guard is not None:
+            outcome.sinks.append(
+                DownstreamSink(
+                    callee_expression=identity.qualname,
+                    callsite=guard,
+                    target=identity,
+                    accepts_changed_argument=False,
+                    reason_code="conditional_guard_rejection",
+                    conditional=state.conditional,
+                )
+            )
+            outcome.rejected += 1
+            outcome.guard_rejected += 1
+            if state.conditional:
+                outcome.conditional_rejections += 1
+            continue
         key_flow = analyze_mapping_key(
             state.function,
             state.parameter,
@@ -561,6 +607,7 @@ def _trace_keyword(
                         )
                     )
                     continue
+                source_call = _source_call(state.function, span)
                 pending.append(
                     _FlowState(
                         function=target_definition,
@@ -568,6 +615,16 @@ def _trace_keyword(
                         depth=state.depth + 1,
                         conditional=conditional,
                         ancestry=(*state.ancestry, key),
+                        concrete=forwarded_call_facts(
+                            state.function,
+                            target_definition,
+                            source_call,
+                            state.parameter,
+                            old_name,
+                            state.concrete,
+                        )
+                        if source_call is not None
+                        else None,
                     )
                 )
                 continue
@@ -631,6 +688,19 @@ def _trace_keyword(
             )
         )
     return outcome, schema_version
+
+
+def _source_call(function: IndexedFunction, span: SourceSpan) -> Optional[ast.Call]:
+    for node in ast.walk(function.node):
+        if (
+            isinstance(node, ast.Call)
+            and node.lineno == span.lineno
+            and node.col_offset == span.col_offset
+            and node.end_lineno == span.end_lineno
+            and node.end_col_offset == span.end_col_offset
+        ):
+            return node
+    return None
 
 
 def _unhandled_analyzer_boundaries(
