@@ -15,6 +15,7 @@ from .core import (
     forwarding_is_conditional,
     forwards_parameter,
     identity_from_target,
+    mapping_effects,
     parameter_reaches_call,
 )
 from .keyflow import KeyEffect, KeyPresence, analyze_mapping_key
@@ -362,7 +363,12 @@ def _trace_keyword(
             )
             continue
         schema_version = analysis.schema_version
-        key_flow = analyze_mapping_key(state.function, state.parameter, old_name)
+        key_flow = analyze_mapping_key(
+            state.function,
+            state.parameter,
+            old_name,
+            mapping_effects=tuple(mapping_effects(analysis, identity)),
+        )
         if key_flow.raised_paths:
             outcome.boundaries.append(
                 AnalysisBoundary(
@@ -395,6 +401,18 @@ def _trace_keyword(
             if presences == frozenset({KeyPresence.ABSENT}):
                 outcome.dropped += 1
                 continue
+            if getattr(call, "binding_status", "unavailable") == "invalid":
+                outcome.boundaries.append(
+                    AnalysisBoundary(
+                        code="downstream_call_binding_invalid",
+                        message=(
+                            "The downstream call has a proven binding error that cannot "
+                            "be attributed solely to the changed keyword."
+                        ),
+                        function=identity,
+                        callsite=call_span(call),
+                    )
+                )
             conditional_presence = KeyPresence.ABSENT in presences
             if conditional_presence:
                 outcome.dropped += 1
@@ -502,6 +520,8 @@ def _trace_keyword(
                 analysis=analysis,
                 relevant_call_ids=relevant_call_ids,
                 function=identity,
+                parameter=state.parameter,
+                old_name=old_name,
             )
         )
 
@@ -536,6 +556,8 @@ def _unhandled_analyzer_boundaries(
     analysis: object,
     relevant_call_ids: set,
     function: FunctionIdentity,
+    parameter: str,
+    old_name: str,
 ) -> List[AnalysisBoundary]:
     handled_reasons = {
         "definition_unavailable",
@@ -552,6 +574,8 @@ def _unhandled_analyzer_boundaries(
             continue
         if reason in handled_reasons:
             continue
+        if not _boundary_may_affect_key(item, parameter, old_name):
+            continue
         boundaries.append(
             AnalysisBoundary(
                 code="pcresolve_{}".format(reason),
@@ -560,6 +584,33 @@ def _unhandled_analyzer_boundaries(
             )
         )
     return boundaries
+
+
+def _boundary_may_affect_key(item: dict, parameter: str, old_name: str) -> bool:
+    """Only discard boundaries PCResolve proves unrelated to this key."""
+
+    if item.get("entry_relation") == "unrelated":
+        return False
+    scope = item.get("affected_scope")
+    if scope == "none":
+        return False
+    if scope == "known":
+        affected = item.get("affected_values", ())
+        if not affected:
+            return True
+        return any(
+            value.get("name") == parameter
+            and (not value.get("element_path") or value["element_path"][0] in {"*", old_name})
+            for value in affected
+        )
+    return (
+        False
+        if any(
+            value.get("name") == parameter and not value.get("element_path")
+            for value in item.get("unaffected_values", ())
+        )
+        else True
+    )
 
 
 def _target_definition(

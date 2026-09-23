@@ -33,6 +33,9 @@ class _State:
 class MappingKeyFlow:
     parameter: str = ""
     mutable_aliases: FrozenSet[str] = frozenset()
+    pcresolve_operations: Dict[
+        Tuple[int, int, int, int], Tuple[Optional[KeyPresence], Optional[KeyEffect]]
+    ] = field(default_factory=dict)
     call_states: Dict[Tuple[int, int, int, int], Set[_State]] = field(default_factory=dict)
     recognized_mutations: Set[Tuple[int, int, int, int]] = field(default_factory=set)
     exception_guarded_calls: Set[Tuple[int, int, int, int]] = field(default_factory=set)
@@ -68,12 +71,16 @@ def analyze_mapping_key(
     function: IndexedFunction,
     parameter: str,
     key: str,
+    *,
+    mapping_effects: Sequence[dict] = (),
 ) -> MappingKeyFlow:
     """Track one known-present key through direct local mapping operations."""
 
+    operations = _pcresolve_operations(mapping_effects, parameter, key)
     result = MappingKeyFlow(
         parameter=parameter,
-        mutable_aliases=_mutable_alias_names(function.node, parameter),
+        mutable_aliases=_mutable_alias_names(function.node, parameter, frozenset(operations)),
+        pcresolve_operations=operations,
     )
     initial = {_State(KeyPresence.PRESENT)}
     remaining = _walk_block(
@@ -235,7 +242,7 @@ def _walk_block(
 def _record_calls(node: ast.AST, states: Set[_State], result: MappingKeyFlow) -> None:
     descendants = tuple(_descendants(node))
     calls = tuple(child for child in descendants if isinstance(child, ast.Call))
-    concurrent_mutation = any(_is_mapping_mutation(call, result.parameter) for call in calls)
+    concurrent_mutation = any(_is_tracked_mutation(call, result) for call in calls)
     visible_states = (
         _set_presence(states, KeyPresence.UNKNOWN, None)
         if concurrent_mutation and len(calls) > 1
@@ -306,15 +313,15 @@ def _apply_expression(
     result: MappingKeyFlow,
 ) -> Set[_State]:
     current = set(states)
-    if _has_conditional_mutation(expression, parameter):
+    if _has_conditional_mutation(expression, result):
         for call in _calls_in_evaluation_order(expression):
-            if _is_mapping_mutation(call, parameter):
+            if _is_tracked_mutation(call, result):
                 result.recognized_mutations.add(_node_key(call))
         return _set_presence(current, KeyPresence.UNKNOWN, None)
     for call in _calls_in_evaluation_order(expression):
         if _passes_mapping_as_data(call, parameter):
             current = _set_presence(current, KeyPresence.UNKNOWN, None)
-        if not _is_mapping_mutation(call, parameter):
+        if not _is_tracked_mutation(call, result):
             continue
         if (
             isinstance(call.func, ast.Attribute)
@@ -324,10 +331,16 @@ def _apply_expression(
             and len(call.args) == 1
             and not any(keyword.arg == "default" for keyword in call.keywords)
             and any(state.presence is not KeyPresence.PRESENT for state in current)
+            and (
+                _node_key(call) in result.pcresolve_operations
+                or _is_mapping_mutation(call, parameter)
+            )
         ):
             result.raised_paths = True
         result.recognized_mutations.add(_node_key(call))
-        operation = _mapping_operation(call, parameter, key)
+        operation = result.pcresolve_operations.get(_node_key(call))
+        if operation is None:
+            operation = _mapping_operation(call, parameter, key)
         if operation is None:
             continue
         presence, effect = operation
@@ -338,7 +351,7 @@ def _apply_expression(
     return current
 
 
-def _has_conditional_mutation(node: ast.AST, parameter: str) -> bool:
+def _has_conditional_mutation(node: ast.AST, result: MappingKeyFlow) -> bool:
     conditional_nodes = (
         ast.IfExp,
         ast.BoolOp,
@@ -350,7 +363,7 @@ def _has_conditional_mutation(node: ast.AST, parameter: str) -> bool:
     return any(
         isinstance(child, conditional_nodes)
         and any(
-            isinstance(inner, ast.Call) and _is_mapping_mutation(inner, parameter)
+            isinstance(inner, ast.Call) and _is_tracked_mutation(inner, result)
             for inner in _descendants(child)
         )
         for child in _descendants(node)
@@ -385,7 +398,11 @@ def _has_loop_exit(node: ast.AST) -> bool:
     return any(isinstance(child, (ast.Break, ast.Continue)) for child in _descendants(node))
 
 
-def _mutable_alias_names(function: ast.AST, parameter: str) -> FrozenSet[str]:
+def _mutable_alias_names(
+    function: ast.AST,
+    parameter: str,
+    verified_operations: FrozenSet[Tuple[int, int, int, int]],
+) -> FrozenSet[str]:
     aliases = {
         target.id
         for statement in _descendants(function)
@@ -402,12 +419,67 @@ def _mutable_alias_names(function: ast.AST, parameter: str) -> FrozenSet[str]:
                 isinstance(child.func.value, ast.Name)
                 and child.func.value.id in aliases
                 and child.func.attr in {"clear", "pop", "popitem", "setdefault", "update"}
+                and _node_key(child) not in verified_operations
             ):
                 mutable.add(child.func.value.id)
         elif isinstance(child, ast.Subscript) and isinstance(child.value, ast.Name):
             if child.value.id in aliases and isinstance(child.ctx, (ast.Store, ast.Del)):
                 mutable.add(child.value.id)
     return frozenset(mutable)
+
+
+def _pcresolve_operations(
+    effects: Sequence[dict], parameter: str, key: str
+) -> Dict[Tuple[int, int, int, int], Tuple[Optional[KeyPresence], Optional[KeyEffect]]]:
+    """Use PCResolve provenance to identify mutations through local aliases."""
+
+    operations = {}
+    for effect in effects:
+        if effect.get("operation") not in {"pop", "delete", "update"}:
+            continue
+        roots = effect.get("mapping", ())
+        if len(roots) != 1 or not (
+            roots[0].get("kind") == "parameter"
+            and roots[0].get("name") == parameter
+            and roots[0].get("element_path", []) in ([], ["*"])
+        ):
+            continue
+        evidence = effect.get("evidence", {})
+        if not all(
+            isinstance(evidence.get(field), int)
+            for field in ("lineno", "col_offset", "end_lineno", "end_col_offset")
+        ):
+            continue
+        location = (
+            evidence["lineno"],
+            evidence["col_offset"],
+            evidence["end_lineno"],
+            evidence["end_col_offset"],
+        )
+        path = effect.get("element_path", ["*"])
+        if effect.get("status") != "bounded" or path == ["*"]:
+            operation = (KeyPresence.UNKNOWN, None)
+        elif path != [key]:
+            operation = (None, None)
+        elif effect["operation"] in {"pop", "delete"}:
+            operation = (KeyPresence.ABSENT, KeyEffect.CONSUMED)
+        elif effect.get("state_after") in {"present", "conditional"}:
+            operation = (KeyPresence.PRESENT, KeyEffect.REASSIGNED)
+        else:
+            operation = (KeyPresence.UNKNOWN, None)
+        previous = operations.get(location)
+        operations[location] = (
+            (KeyPresence.UNKNOWN, None)
+            if previous is not None and previous != operation
+            else operation
+        )
+    return operations
+
+
+def _is_tracked_mutation(call: ast.Call, result: MappingKeyFlow) -> bool:
+    return _node_key(call) in result.pcresolve_operations or _is_mapping_mutation(
+        call, result.parameter
+    )
 
 
 def _passes_mapping_as_data(call: ast.Call, parameter: str) -> bool:

@@ -81,6 +81,19 @@ def direct_calls(analysis: Any, caller: FunctionIdentity) -> Iterable[Any]:
             yield call
 
 
+def mapping_effects(analysis: Any, function: FunctionIdentity) -> Iterable[dict]:
+    """Return element effects for one exact analyzed function, when available."""
+
+    for summary in analysis.functions:
+        owner = summary.get("function", {})
+        if (
+            owner.get("module") == function.module
+            and owner.get("qualname") == function.qualname
+            and (not function.lineno or owner.get("lineno") == function.lineno)
+        ):
+            yield from summary.get("mapping_effects", ())
+
+
 def forwards_parameter(call: Any, parameter: str, kind: VariadicKind) -> bool:
     return any(
         flow.get("source_parameter") == parameter
