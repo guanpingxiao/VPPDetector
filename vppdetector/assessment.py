@@ -25,6 +25,7 @@ from .core import (
     forwards_parameter,
     identity_from_target,
     mapping_effects,
+    mapping_reaches_callable_candidate,
     parameter_reaches_call,
 )
 from .keyflow import KeyEffect, KeyPresence, analyze_mapping_key
@@ -527,6 +528,19 @@ def _trace_keyword(
                 continue
             if not forwards_parameter(call, state.parameter, VariadicKind.KEYWORD):
                 indirect = True
+                if mapping_reaches_callable_candidate(call, state.parameter):
+                    outcome.sinks.append(
+                        DownstreamSink(
+                            callee_expression=call.callee_name,
+                            callsite=span,
+                            target=identity_from_target(call.target),
+                            accepts_changed_argument=None,
+                            reason_code="mapping_passed_to_callable_candidate",
+                            conditional=True,
+                            target_candidates=candidate_identities(call),
+                            callable_instance_evidence=call.callable_instance_evidence,
+                        )
+                    )
                 continue
             expanded = True
             presences = key_flow.presence_at(span)

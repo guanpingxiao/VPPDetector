@@ -126,6 +126,24 @@ def parameter_reaches_call(call: Any, parameter: str) -> bool:
     return any(flow.get("source_parameter") == parameter for flow in call.parameter_flows)
 
 
+def mapping_reaches_callable_candidate(call: Any, parameter: str) -> bool:
+    """Recognize an element-bearing mapping passed to a source-only callable."""
+
+    if call.target_status != "callable_instance_candidate" or call.target is None:
+        return False
+    if not getattr(call, "callable_instance_evidence", None):
+        return False
+    return any(
+        source.get("kind") == "parameter"
+        and source.get("source") == parameter
+        and "*" in source.get("output_path", ())
+        for argument in getattr(call, "argument_sources", ())
+        if not argument.get("argument", {}).get("starred")
+        and argument.get("argument", {}).get("keyword", "ordinary") is not None
+        for source in argument.get("sources", ())
+    )
+
+
 def forwarding_is_conditional(call: Any, parameter: str) -> bool:
     return any(
         bool(flow.get("conditions"))

@@ -163,6 +163,7 @@ class DownstreamSink:
     conditional: bool = False
     target_candidates: Tuple[FunctionIdentity, ...] = field(default_factory=tuple)
     receiver_type_evidence: Tuple[dict, ...] = field(default_factory=tuple)
+    callable_instance_evidence: Optional[dict] = None
 
 
 @dataclass(frozen=True)
