@@ -19,6 +19,10 @@ is an internal analysis boundary intended to refine PCART's existing
 compatibility and repair pipeline rather than become another user-facing
 command.
 
+An assessment marked `SAFE` rules out the analyzed variadic-argument
+compatibility pitfall; it does not guarantee that the whole client program
+succeeds for unrelated reasons.
+
 ## Requirements
 
 - Python 3.9 or newer

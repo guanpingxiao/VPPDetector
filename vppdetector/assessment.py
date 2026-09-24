@@ -11,6 +11,7 @@ from .conditional import (
     ConcreteCall,
     entry_call_facts,
     forwarded_call_facts,
+    proven_concrete_key_consumption,
     proven_guard_rejection,
 )
 from .core import (
@@ -163,6 +164,24 @@ def assess_change(
             boundary.code,
             boundary.message,
             boundaries=(*index.boundaries, boundary),
+            entry_binding=entry_binding,
+        )
+
+    consumed_at = proven_concrete_key_consumption(
+        function,
+        change.captured_by,
+        change.old_name,
+        entry_call_facts(request.callsite, function, change.old_name),
+    )
+    if consumed_at is not None:
+        return _assessment(
+            request,
+            Verdict.SAFE,
+            ArgumentEffect.CONSUMED,
+            "concrete_old_keyword_consumed_before_forwarding",
+            "For this concrete call, the sole captured old keyword is removed before "
+            "downstream forwarding.",
+            boundaries=index.boundaries,
             entry_binding=entry_binding,
         )
 
