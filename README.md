@@ -102,6 +102,12 @@ The assessment returns propagation effects, downstream evidence, and analysis
 boundaries. It deliberately does not select a delete, rename, or preserve
 repair action; that policy belongs to PCART.
 
+When PCResolve reports constructor-backed chained receivers, assessment and
+scan findings retain the bounded source target candidates and receiver-type
+evidence. A candidate is not treated as certain runtime dispatch: dynamic
+accessor and method overrides remain explicit uncertainty, and a rejecting
+candidate can establish at most a possible failure.
+
 Current assessment support intentionally starts with direct `**kwargs`
 propagation and follows resolved `**kwargs` forwarding across multiple local
 functions. For a concrete call site, a narrow guard proof can also identify

@@ -66,13 +66,33 @@ class AnalysisContext:
 
 
 def identity_from_target(target: Any) -> FunctionIdentity:
-    path = getattr(target, "file_path", "")
+    if isinstance(target, dict):
+        path = target.get("file_path", "")
+        module = target.get("module", "")
+        qualname = target.get("qualname", "")
+        lineno = target.get("lineno", 0)
+    else:
+        path = getattr(target, "file_path", "")
+        module = getattr(target, "module", "")
+        qualname = getattr(target, "qualname", "")
+        lineno = getattr(target, "lineno", 0)
     return FunctionIdentity(
-        module=getattr(target, "module", ""),
-        qualname=getattr(target, "qualname", ""),
+        module=module,
+        qualname=qualname,
         file_path=Path(path) if path else None,
-        lineno=getattr(target, "lineno", 0) or None,
+        lineno=lineno or None,
     )
+
+
+def candidate_identities(call: Any) -> tuple[FunctionIdentity, ...]:
+    """Read source candidates without treating them as certain runtime targets."""
+
+    result = []
+    for candidate in getattr(call, "target_candidates", ()):
+        identity = identity_from_target(candidate)
+        if identity not in result:
+            result.append(identity)
+    return tuple(result)
 
 
 def direct_calls(analysis: Any, caller: FunctionIdentity) -> Iterable[Any]:

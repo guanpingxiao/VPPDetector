@@ -161,6 +161,8 @@ class DownstreamSink:
     accepts_changed_argument: Optional[bool]
     reason_code: str
     conditional: bool = False
+    target_candidates: Tuple[FunctionIdentity, ...] = field(default_factory=tuple)
+    receiver_type_evidence: Tuple[dict, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -192,6 +194,8 @@ class ForwardingFinding:
     target: Optional[FunctionIdentity]
     kind: FindingKind
     reason_code: str
+    target_candidates: Tuple[FunctionIdentity, ...] = field(default_factory=tuple)
+    receiver_type_evidence: Tuple[dict, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

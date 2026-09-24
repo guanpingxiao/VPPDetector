@@ -9,6 +9,7 @@ from .core import (
     AnalysisContext,
     ResolutionError,
     call_span,
+    candidate_identities,
     direct_calls,
     forwards_parameter,
     identity_from_target,
@@ -81,11 +82,16 @@ def scan_package(
                 if not forwards_parameter(call, parameter_name, parameter_kind):
                     continue
                 target_identity = identity_from_target(call.target) if call.target else None
+                target_candidates = candidate_identities(call)
                 target_definition = _target_definition(index, target_identity)
                 ambiguity = _target_ambiguity(analysis, call.id)
                 if target_definition is None:
-                    kind = FindingKind.UNRESOLVED_TARGET
-                    reason_code = "target_definition_unavailable"
+                    if target_candidates:
+                        kind = FindingKind.AMBIGUOUS_TARGET
+                        reason_code = "source_target_candidates_only"
+                    else:
+                        kind = FindingKind.UNRESOLVED_TARGET
+                        reason_code = "target_definition_unavailable"
                 elif ambiguity:
                     kind = FindingKind.AMBIGUOUS_TARGET
                     reason_code = "pcresolve_{}".format(ambiguity)
@@ -105,6 +111,8 @@ def scan_package(
                         target=target_identity,
                         kind=kind,
                         reason_code=reason_code,
+                        target_candidates=target_candidates,
+                        receiver_type_evidence=tuple(getattr(call, "receiver_type_evidence", ())),
                     )
                 )
 

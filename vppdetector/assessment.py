@@ -18,6 +18,7 @@ from .core import (
     PCResolveAdapter,
     ResolutionError,
     call_span,
+    candidate_identities,
     direct_calls,
     forwarding_is_conditional,
     forwards_parameter,
@@ -550,9 +551,32 @@ def _trace_keyword(
                 or forwarding_is_conditional(call, state.parameter)
             )
             target_identity = identity_from_target(call.target) if call.target else None
+            target_candidates = candidate_identities(call)
             target_definition = _target_definition(index, target_identity)
+            if call.target_status == "returned_field_candidate":
+                outcome.boundaries.append(
+                    AnalysisBoundary(
+                        code="downstream_target_source_candidate",
+                        message=(
+                            "The constructor-backed returned field identifies a source target, "
+                            "but dynamic accessor or method dispatch can select another callee."
+                        ),
+                        function=identity,
+                        callsite=span,
+                    )
+                )
 
             if target_definition is None:
+                if target_candidates:
+                    _record_source_candidates(
+                        outcome=outcome,
+                        index=index,
+                        function=identity,
+                        call=call,
+                        candidates=target_candidates,
+                        old_name=old_name,
+                    )
+                    continue
                 outcome.sinks.append(
                     DownstreamSink(
                         callee_expression=call.callee_name,
@@ -561,6 +585,8 @@ def _trace_keyword(
                         accepts_changed_argument=None,
                         reason_code="target_definition_unavailable",
                         conditional=conditional,
+                        target_candidates=target_candidates,
+                        receiver_type_evidence=tuple(getattr(call, "receiver_type_evidence", ())),
                     )
                 )
                 outcome.boundaries.append(
@@ -582,6 +608,8 @@ def _trace_keyword(
                         accepts_changed_argument=True,
                         reason_code="target_explicitly_accepts_old_keyword",
                         conditional=conditional,
+                        target_candidates=target_candidates,
+                        receiver_type_evidence=tuple(getattr(call, "receiver_type_evidence", ())),
                     )
                 )
                 outcome.accepted += 1
@@ -596,6 +624,8 @@ def _trace_keyword(
                         accepts_changed_argument=True,
                         reason_code="forwarded_to_variadic_target",
                         conditional=conditional,
+                        target_candidates=target_candidates,
+                        receiver_type_evidence=tuple(getattr(call, "receiver_type_evidence", ())),
                     )
                 )
                 if state.depth + 1 >= max_depth:
@@ -637,6 +667,8 @@ def _trace_keyword(
                     accepts_changed_argument=False,
                     reason_code="target_rejects_old_keyword",
                     conditional=conditional,
+                    target_candidates=target_candidates,
+                    receiver_type_evidence=tuple(getattr(call, "receiver_type_evidence", ())),
                 )
             )
             outcome.rejected += 1
@@ -688,6 +720,54 @@ def _trace_keyword(
             )
         )
     return outcome, schema_version
+
+
+def _record_source_candidates(
+    *,
+    outcome: _FlowOutcome,
+    index: SourceIndex,
+    function: FunctionIdentity,
+    call: object,
+    candidates: Tuple[FunctionIdentity, ...],
+    old_name: str,
+) -> None:
+    """Report possible signatures without selecting a runtime dispatch target."""
+
+    span = call_span(call)
+    outcome.boundaries.append(
+        AnalysisBoundary(
+            code="downstream_target_candidates_only",
+            message="PCResolve reported source-level targets, not a certain runtime callee.",
+            function=function,
+            callsite=span,
+        )
+    )
+    for candidate in candidates:
+        definition = _target_definition(index, candidate)
+        accepts = definition.signature.accepts_keyword(old_name) if definition is not None else None
+        outcome.sinks.append(
+            DownstreamSink(
+                callee_expression=call.callee_name,
+                callsite=span,
+                target=candidate,
+                accepts_changed_argument=accepts,
+                reason_code=(
+                    "source_candidate_accepts_old_keyword"
+                    if accepts is True
+                    else "source_candidate_rejects_old_keyword"
+                    if accepts is False
+                    else "source_candidate_definition_unavailable"
+                ),
+                conditional=True,
+                target_candidates=candidates,
+                receiver_type_evidence=tuple(getattr(call, "receiver_type_evidence", ())),
+            )
+        )
+        if accepts is False:
+            outcome.rejected += 1
+            outcome.conditional_rejections += 1
+        elif accepts is True:
+            outcome.accepted += 1
 
 
 def _source_call(function: IndexedFunction, span: SourceSpan) -> Optional[ast.Call]:
