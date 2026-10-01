@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple
@@ -64,6 +65,7 @@ class AnalysisContext:
     index: SourceIndex
     adapter: PCResolveAdapter
     _scan_cache: dict = field(default_factory=dict, init=False, repr=False)
+    _transform_spans: dict = field(default_factory=dict, init=False, repr=False)
 
     @classmethod
     def from_source(cls, source: SourceContext) -> "AnalysisContext":
@@ -79,8 +81,10 @@ class AnalysisContext:
             return entry
         if identity.file_path or identity.lineno:
             return None
-        # Inherited methods are resolved by PCResolve, not by name heuristics.
-        analysis = self.adapter.analyze(identity)
+        # Resolve the public class prefix before asking PCResolve for an
+        # inherited implementation. Never fall back to a terminal name match.
+        method = self.index.resolve_method_identity(identity)
+        analysis = self.adapter.analyze(method or identity)
         return self.index.find(identity_from_target(analysis.entry))
 
 
@@ -198,10 +202,15 @@ def scan_function(
                 for flow in call.parameter_flows
                 if flow.get("source_parameter") == state.parameter
             ]
+            flows.extend(
+                _returned_flows(
+                    context, analysis, state, call, max_depth - len(state.path) - 1, boundaries
+                )
+            )
             if not flows:
                 continue
             relevant_calls.add(call.id)
-            carried = [flow for flow in flows if _whole_container(flow)]
+            carried = [flow for flow in flows if _open_container(context, flow)]
             span = call_span(call)
             uncertain_operation = _carrier_operation_boundary(
                 analysis, identity, state.parameter, call
@@ -244,11 +253,7 @@ def scan_function(
                 )
                 continue
             for target in targets:
-                definition = (
-                    context.index.find_by_location(target.file_path, target.lineno)
-                    if target.file_path and target.lineno
-                    else context.index.find(target)
-                )
+                definition = _target_definition(context, target)
                 if definition is None:
                     boundaries.append(
                         AnalysisBoundary(
@@ -268,8 +273,18 @@ def scan_function(
                     definition.identity,
                     status,
                 )
-                path = (*state.path, step)
                 for flow in carried:
+                    path = (*state.path, *flow.get("return_steps", ()), step)
+                    if len(path) > max_depth:
+                        boundaries.append(
+                            AnalysisBoundary(
+                                "max_forwarding_depth_reached",
+                                "Forwarding depth limit reached.",
+                                identity,
+                                span,
+                            )
+                        )
+                        continue
                     expansion = _expansion_kind(flow.get("argument", {}))
                     if expansion is not None:
                         if expansion != state.kind:
@@ -359,6 +374,338 @@ def _parameters(function: IndexedFunction) -> tuple:
         )
         if name is not None
     )
+
+
+def _open_container(context: AnalysisContext, flow: dict) -> bool:
+    """Do not confuse a comprehension dependency with an open parameter space.
+
+    PCResolve currently gives some finite comprehensions a wildcard element
+    path. Source evidence is used only to reject that unproved shape; this is
+    not a second propagation analysis.
+    """
+
+    if not _whole_container(flow):
+        return False
+    for evidence in flow.get("evidence", ()):
+        path = Path(evidence.get("file_path", ""))
+        if path not in context._transform_spans:
+            context._transform_spans[path] = {
+                (node.lineno, node.col_offset, node.end_lineno, node.end_col_offset)
+                for function in context.index.functions
+                if function.identity.file_path == path
+                for node in ast.walk(function.node)
+                if isinstance(node, (ast.DictComp, ast.ListComp, ast.SetComp, ast.GeneratorExp))
+            }
+        location = tuple(
+            evidence.get(name) for name in ("lineno", "col_offset", "end_lineno", "end_col_offset")
+        )
+        if location in context._transform_spans[path]:
+            return False
+    return True
+
+
+def _depends_on_parameter(values: Iterable[dict], parameter: str, calls: dict) -> bool:
+    """Use input dependencies only to select relevant return queries, not to prove shape."""
+
+    pending, seen = list(values), set()
+    while pending:
+        value = pending.pop()
+        if value.get("kind") == "parameter" and value.get("source") == parameter:
+            return True
+        producer = calls.get(value.get("source"))
+        if value.get("kind") == "call_result" and producer and producer.id not in seen:
+            seen.add(producer.id)
+            pending.extend(
+                value for item in producer.argument_sources for value in item.get("sources", ())
+            )
+    return False
+
+
+def _returned_flows(
+    context: AnalysisContext,
+    analysis: Any,
+    state: _State,
+    destination: Any,
+    budget: int,
+    boundaries: list,
+) -> list[dict]:
+    """Compose source-resolved whole-container returns using PCResolve's router.
+
+    An ordinary call's input dependency is not a return-shape guarantee. Only
+    unprojected container returns with source summaries are substituted, and
+    unknown effects, dynamic producers, cycles and depth limits stay visible.
+    """
+
+    local_calls = {call.id: call for call in direct_calls(analysis, state.function.identity)}
+    arguments = [
+        item
+        for item in destination.argument_sources
+        if isinstance(item.get("argument"), dict)
+        and any(value.get("kind") == "call_result" for value in item.get("sources", ()))
+        and _depends_on_parameter(item.get("sources", ()), state.parameter, local_calls)
+    ]
+    if not arguments:
+        return []
+    from pcresolve.return_resolution import (
+        CallBinding,
+        ResolutionLimits,
+        ReturnCall,
+        resolve_return_dependencies,
+    )
+
+    summaries, calls, producers = {}, {}, {}
+
+    def boundary(code, message, call):
+        boundaries.append(
+            AnalysisBoundary(code, message, identity_from_target(call.caller), call_span(call))
+        )
+
+    def safe_values(values, owner, owner_analysis, endpoint):
+        result = []
+        for value in values:
+            if not _open_container(context, value):
+                continue
+            read_at = endpoint
+            if endpoint is owner.node:
+                locations = [
+                    evidence
+                    for evidence in value.get("evidence", ())
+                    if Path(evidence.get("file_path", "")) == owner.identity.file_path
+                    and evidence.get("lineno") is not None
+                ]
+                if locations:
+                    evidence = max(
+                        locations,
+                        key=lambda item: (
+                            item.get("end_lineno", item["lineno"]),
+                            item.get("end_col_offset", 0),
+                        ),
+                    )
+                    read_at = SourceSpan(
+                        owner.identity.file_path,
+                        evidence["lineno"],
+                        evidence.get("col_offset", 0),
+                        evidence.get("end_lineno", evidence["lineno"]),
+                        evidence.get("end_col_offset", 0),
+                    )
+            operation = _return_operation_boundary(owner_analysis, owner.identity, value, read_at)
+            if operation is not None:
+                boundaries.append(
+                    AnalysisBoundary(
+                        "unsupported_carrier_operation",
+                        "Unknown effect obscures a returned container.",
+                        owner.identity,
+                        operation,
+                    )
+                )
+                continue
+            result.append(value)
+        return result
+
+    def collect(values, owner, owner_analysis, remaining, stack):
+        owner_calls = {call.id: call for call in direct_calls(owner_analysis, owner.identity)}
+        for value in values:
+            if value.get("kind") != "call_result":
+                continue
+            producer = owner_calls.get(value.get("source"))
+            if producer is None:
+                continue
+            if producer.analysis_status != "analyzed" or producer.binding_status == "invalid":
+                boundary(
+                    "return_binding_unavailable", "No usable container return binding.", producer
+                )
+                continue
+            if not producer.target or _target_status(owner_analysis, producer) != "resolved":
+                boundary(
+                    "return_target_unresolved",
+                    "No exact source target for container return.",
+                    producer,
+                )
+                continue
+            target = identity_from_target(producer.target)
+            definition = _target_definition(context, target)
+            if definition is None:
+                boundary(
+                    "return_definition_unavailable",
+                    "Container return source is unavailable.",
+                    producer,
+                )
+                continue
+            if definition.identity in stack:
+                boundary("recursive_return_flow", "Recursive container return path.", producer)
+                continue
+            if remaining <= 0:
+                boundary(
+                    "max_forwarding_depth_reached",
+                    "Container return depth limit reached.",
+                    producer,
+                )
+                continue
+            try:
+                child = context.adapter.analyze(definition.identity)
+            except ResolutionError as exc:
+                boundary("return_analysis_failed", str(exc), producer)
+                continue
+            bindings = tuple(
+                CallBinding(
+                    "parameter",
+                    item["parameter"],
+                    safe_values(item.get("sources", ()), owner, owner_analysis, producer),
+                    _return_binding_path(item, definition, state.kind),
+                )
+                for item in producer.argument_sources
+                if item.get("parameter") is not None
+            )
+            returns = next(
+                (
+                    item.get("returns", ())
+                    for item in child.functions
+                    if identity_from_target(item["function"]) == definition.identity
+                ),
+                (),
+            )
+            returns = safe_values(returns, definition, child, definition.node)
+            # A capture's wildcard describes elements of the returned container,
+            # not an extra nested container. Exact expansion bindings below
+            # supply the open space; finite capture paths remain finite.
+            returns = [
+                dict(value, relation="direct", output_path=[])
+                if value.get("kind") == "parameter"
+                and value.get("source") in (definition.signature.vararg, definition.signature.kwarg)
+                and value.get("output_path") == ["*"]
+                else value
+                for value in returns
+            ]
+            summaries[definition.identity] = returns
+            calls[producer.id] = ReturnCall(producer.id, definition.identity, bindings)
+            producers[producer.id] = producer
+            collect(returns, definition, child, remaining - 1, (*stack, definition.identity))
+            collect(
+                (value for binding in bindings for value in binding.values),
+                owner,
+                owner_analysis,
+                remaining - 1,
+                stack,
+            )
+
+    result = []
+    for number, argument in enumerate(arguments):
+        values = safe_values(argument["sources"], state.function, analysis, destination)
+        collect(values, state.function, analysis, budget, (state.function.identity,))
+        entry_key = ("vpp_argument", destination.id, number)
+        summaries[entry_key] = values
+        resolution = resolve_return_dependencies(
+            entry_key,
+            state.parameter,
+            summaries,
+            calls,
+            limits=ResolutionLimits(max_iterations=max(2, budget + 2)),
+        )
+        if resolution.status != "converged":
+            boundary("return_flow_limit_reached", "Return dependency budget reached.", destination)
+        for flow in resolution.paths:
+            steps = []
+            for call_id in flow.get("call_context", ()):
+                producer = producers[call_id]
+                owner = identity_from_target(producer.caller)
+                parameter = (
+                    state.parameter
+                    if owner == state.function.identity
+                    else next(
+                        (
+                            item["source_parameter"]
+                            for item in producer.parameter_flows
+                            if _open_container(context, item)
+                        ),
+                        state.parameter,
+                    )
+                )
+                steps.append(
+                    ForwardingStep(
+                        owner,
+                        parameter,
+                        producer.callee_name,
+                        call_span(producer),
+                        identity_from_target(producer.target),
+                    )
+                )
+            result.append(
+                dict(
+                    flow,
+                    source_parameter=state.parameter,
+                    argument=argument["argument"],
+                    target_parameter=argument.get("parameter"),
+                    target_path=argument.get("target_path", ()),
+                    return_steps=tuple(steps),
+                )
+            )
+    return result
+
+
+def _target_definition(
+    context: AnalysisContext, target: FunctionIdentity
+) -> Optional[IndexedFunction]:
+    return (
+        context.index.find_by_location(target.file_path, target.lineno)
+        if target.file_path and target.lineno
+        else context.index.find(target)
+    )
+
+
+def _return_binding_path(item: dict, function: IndexedFunction, root_kind: VariadicKind) -> tuple:
+    """Flatten only PCResolve's exact expansion-to-capture wildcard binding."""
+
+    path = tuple(item.get("target_path", ()))
+    argument = item.get("argument")
+    if path != ("*",) or not isinstance(argument, dict):
+        return path
+    channel = _expansion_kind(argument)
+    if channel is not root_kind:
+        return path
+    formal = (
+        function.signature.kwarg
+        if channel is VariadicKind.KEYWORD
+        else function.signature.vararg
+        if channel is VariadicKind.POSITIONAL
+        else None
+    )
+    return () if formal is not None and item.get("parameter") == formal else path
+
+
+def _return_operation_boundary(
+    analysis: Any, identity: FunctionIdentity, value: dict, destination: Any
+) -> Optional[SourceSpan]:
+    """Unknown effects on a returned alias must not restore open contents.
+
+    This does not infer interprocedural purity. Passing the carrier to an
+    additional ordinary call before reading it leaves its contents unproved.
+    The producer call currently being bound is not such a prior side effect.
+    """
+
+    endpoint = (
+        destination.end_lineno or destination.lineno,
+        destination.end_col_offset or destination.col_offset,
+    )
+    for call in direct_calls(analysis, identity):
+        if call.id == getattr(destination, "id", None):
+            continue
+        if (call.lineno, call.col_offset) > endpoint:
+            continue
+        receiver = call.receiver_sources if call.target_status == "receiver_unresolved" else ()
+        ordinary = (
+            source
+            for item in call.argument_sources
+            if isinstance(item.get("argument"), dict) and _expansion_kind(item["argument"]) is None
+            for source in item.get("sources", ())
+        )
+        if any(
+            source.get("kind") == value.get("kind")
+            and source.get("source") == value.get("source")
+            and _whole_container(source)
+            for source in (*receiver, *ordinary)
+        ):
+            return call_span(call)
+    return None
 
 
 def _carrier_operation_boundary(

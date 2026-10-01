@@ -89,11 +89,17 @@ the requested API to its source implementation; findings retain the requested
 API identity and the path retains implementation identities.
 
 The scanner supports functions, methods, `async def`, cross-file imports,
-aliases and bounded multi-hop propagation covered by PCResolve. Passing a
+aliases, public class re-exports, inherited methods and source constructor
+entries (`__init__`, otherwise `__new__`). Ambiguous constructor definitions
+are not replaced with a guessed entry. Bounded multi-hop propagation includes
+source-resolved helpers returning a whole container; the evidence path retains
+those return-producing calls, and they count toward `max_depth`. Passing a
 mapping or sequence as an ordinary parameter is a propagation hop, not a VPP
 by itself; a finding requires an eventual `**mapping` or `*sequence` expansion
 into a signature without the matching variadic parameter. Unresolved targets,
 unsupported propagation, recursion and depth limits remain visible diagnostics.
+Unknown effects on returned containers and transformations without open-shape
+facts (including comprehensions, copies and slices) remain analysis boundaries.
 Source-candidate paths retain their target status: a finding does not establish
 exact runtime dispatch or prove that a particular client call will fail.
 

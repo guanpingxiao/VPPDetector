@@ -69,6 +69,7 @@ class SourceIndex:
     constructors: Tuple[IndexedConstructor, ...]
     boundaries: Tuple[AnalysisBoundary, ...]
     imports: dict = field(default_factory=dict)
+    classes: Tuple[FunctionIdentity, ...] = ()
     _definition_index: object = field(default=None, init=False, repr=False)
 
     def find(self, identity: FunctionIdentity) -> Optional[IndexedFunction]:
@@ -114,6 +115,41 @@ class SourceIndex:
             ]
             return constructors[0] if len(constructors) == 1 else None
 
+        definitions = self._definitions()
+        function = definitions.resolve_name(identity.module, "", identity.qualname, self.imports)
+        if function is not None:
+            return function
+        class_identity = definitions.resolve_name(
+            identity.module, "", identity.qualname, self.imports, kind="class"
+        )
+        if class_identity is None:
+            return None
+        constructors = [
+            item.function for item in self.constructors if item.class_identity == class_identity
+        ]
+        return constructors[0] if len(constructors) == 1 else None
+
+    def resolve_method_identity(self, identity: FunctionIdentity) -> Optional[FunctionIdentity]:
+        """Canonicalize a class prefix; PCResolve still owns inherited lookup."""
+
+        function = self.find(identity)
+        if function is not None:
+            return function.identity
+        if identity.file_path or identity.lineno:
+            return None
+        owner, separator, method = identity.qualname.rpartition(".")
+        if not separator:
+            return None
+        class_identity = self._definitions().resolve_name(
+            identity.module, "", owner, self.imports, kind="class"
+        )
+        if class_identity is None:
+            return None
+        # Location belongs to the requested method, not to its declaring class.
+        # An inherited implementation can be in a different source module.
+        return FunctionIdentity(class_identity.module, class_identity.qualname + "." + method)
+
+    def _definitions(self):
         if self._definition_index is None:
             from pcresolve.call_resolution import DefinitionIndex, DefinitionRecord
 
@@ -130,23 +166,15 @@ class SourceIndex:
                 )
             records.extend(
                 DefinitionRecord(
-                    item.class_identity.module,
-                    item.class_identity.qualname,
-                    item.function,
+                    identity.module,
+                    identity.qualname,
+                    identity,
                     kind="class",
                 )
-                for item in self.constructors
+                for identity in self.classes
             )
             self._definition_index = DefinitionIndex(records)
-
-        function = self._definition_index.resolve_name(
-            identity.module, "", identity.qualname, self.imports
-        )
-        if function is not None:
-            return function
-        return self._definition_index.resolve_name(
-            identity.module, "", identity.qualname, self.imports, kind="class"
-        )
+        return self._definition_index
 
     def find_by_location(self, file_path: Path, lineno: int) -> Optional[IndexedFunction]:
         resolved = file_path.resolve()
@@ -177,6 +205,7 @@ class _FunctionCollector(ast.NodeVisitor):
         self.scope_kinds: List[str] = []
         self.functions: List[IndexedFunction] = []
         self.constructors: List[IndexedConstructor] = []
+        self.classes: List[FunctionIdentity] = []
 
     def generic_visit(self, node: ast.AST) -> None:
         # Definitions live in statement structure, not inside expressions.
@@ -188,22 +217,35 @@ class _FunctionCollector(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         class_qualname = ".".join((*self.scope, node.name))
-        constructor = next(
-            (
+        class_identity = FunctionIdentity(
+            module=self.module,
+            qualname=class_qualname,
+            file_path=self.file_path,
+            lineno=node.lineno,
+        )
+        self.classes.append(class_identity)
+        constructor = None
+        # Match PCResolve's source constructor preference without inferring
+        # metaclass behavior: direct __init__, otherwise direct __new__.
+        for method in ("__init__", "__new__"):
+            candidates = [
                 item
                 for item in node.body
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and item.name == "__init__"
-            ),
-            None,
-        )
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == method
+            ]
+            implementations = [
+                item
+                for item in candidates
+                if not any(_is_overload_decorator(d) for d in item.decorator_list)
+            ]
+            if len(implementations) == 1:
+                constructor = implementations[0]
+                break
+            if candidates:
+                # A declared initializer with no unique implementation is not
+                # evidence that construction instead uses the allocator body.
+                break
         if constructor is not None:
-            class_identity = FunctionIdentity(
-                module=self.module,
-                qualname=class_qualname,
-                file_path=self.file_path,
-                lineno=node.lineno,
-            )
             constructor_identity = FunctionIdentity(
                 module=self.module,
                 qualname="{}.{}".format(class_qualname, constructor.name),
@@ -274,6 +316,7 @@ def build_source_index(source: SourceContext) -> SourceIndex:
     files = tuple(_python_files(root))
     functions: List[IndexedFunction] = []
     constructors: List[IndexedConstructor] = []
+    classes: List[FunctionIdentity] = []
     boundaries: List[AnalysisBoundary] = []
     imports = {}
 
@@ -324,6 +367,7 @@ def build_source_index(source: SourceContext) -> SourceIndex:
         collector.visit(tree)
         functions.extend(collector.functions)
         constructors.extend(collector.constructors)
+        classes.extend(collector.classes)
 
     return SourceIndex(
         source=normalized_source,
@@ -332,6 +376,7 @@ def build_source_index(source: SourceContext) -> SourceIndex:
         constructors=tuple(constructors),
         boundaries=tuple(boundaries),
         imports=imports,
+        classes=tuple(classes),
     )
 
 
