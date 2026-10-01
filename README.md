@@ -1,27 +1,25 @@
 # VPPDetector
 
-VPPDetector analyzes propagation of Python variadic parameters. The current
-repository is a research scanner and an incubation area for analysis that may
-later be integrated into PCART. It is not positioned as an
-independently published PyPI product.
+VPPDetector detects potential variadic-parameter pitfalls in Python library
+source. A VPP occurs when a library API's `*args` or `**kwargs` propagates to
+a downstream expansion whose signature lacks the corresponding variadic
+parameter. Findings identify the root API, parameter channel, forwarding
+path and source locations.
 
-The code has two responsibilities:
+Two scan scopes share the same detection core:
 
-1. `scan_package()` scans one library version for latent variadic-parameter
-   forwarding mismatches.
-2. The internal `assess_change()` prototype analyzes one already-detected
-   parameter deletion or rename against the target implementation.
+- `scan_package()` scans a whole library version for VPPs.
+- `scan_api()` scans one API and its downstream forwarding paths on demand.
 
-VPPDetector does not compare every API in two library versions. API matching
-and parameter-change detection remain the responsibility of clients such as
-PCART. The scanner is the standalone workflow. Change-conditioned assessment
-is an internal analysis boundary intended to refine PCART's existing
-compatibility and repair pipeline rather than become another user-facing
-command.
+Both return a `ScanReport` with positive findings and `has_vpp`. Analysis
+limits are recorded separately in `boundaries`; an empty findings collection
+means no VPP was detected within the supported analysis, rather than proof
+that all dynamic Python behavior is compatible.
 
-An assessment marked `SAFE` rules out the analyzed variadic-argument
-compatibility pitfall; it does not guarantee that the whole client program
-succeeds for unrelated reasons.
+VPPDetector uses PCResolve for program facts and call resolution. API matching,
+parameter-change detection, repair selection and repair verification belong
+to PCART. The repository remains a research scanner and an incubation area
+for later PCART integration, without a separate PyPI release.
 
 ## Requirements
 
@@ -49,81 +47,60 @@ python vppdetector.py /sources/example --output report.json
 ```
 
 Use repeated `--import-root` options when module names cannot be derived from
-the package root. On Windows, use the corresponding PowerShell line
-continuation syntax or enter the command on one line.
+the package root. The root script remains a thin whole-package scan entry
+point, with optional JSON output for standalone use.
 
-The root script is intentionally a thin scan entry point. The original
-dataset-oriented implementation remains in `legacy_vppdetector.py` for
-research reproducibility.
+## Python API
 
-## Analysis API
-
-### Single-version scan
+### Whole-library scan
 
 ```python
 from vppdetector import scan_package
 
 report = scan_package("/sources/example")
-for finding in report.potential_pitfalls:
-    print(finding.function, finding.target, finding.callsite)
+print(report.has_vpp)
+for finding in report.findings:
+    print(finding.function, finding.parameter_kind, finding.target)
+    for step in finding.path:
+        print(step.function, step.callee_expression, step.callsite)
 ```
 
-The scanner uses PCResolve for exact cross-file call targets and records every
-forwarding call site independently. It supports functions, methods,
-`async def`, imports, and aliases covered by PCResolve.
-
-### Internal change refinement
+### On-demand API scan
 
 ```python
 from pathlib import Path
 
-from vppdetector import (
-    ChangeKind,
-    FunctionIdentity,
-    ParameterChange,
-    SourceContext,
-    VPPRequest,
-    VariadicKind,
-    assess_change,
-)
+from vppdetector import AnalysisContext, FunctionIdentity, SourceContext, scan_api
 
-request = VPPRequest(
-    source=SourceContext(Path("/sources/example")),
-    target_api=FunctionIdentity("example.api", "wrapper"),
-    change=ParameterChange(
-        kind=ChangeKind.DELETE,
-        old_name="callback",
-        captured_by="kwargs",
-        capture_kind=VariadicKind.KEYWORD,
-    ),
+source = SourceContext(Path("/sources/example"))
+context = AnalysisContext.from_source(source)
+report = scan_api(
+    source,
+    FunctionIdentity("example.api", "wrapper"),
+    context=context,
 )
-
-assessment = assess_change(request)
-print(assessment.verdict, assessment.argument_effect)
+print(report.has_vpp)
 ```
 
-The assessment returns propagation effects, downstream evidence, and analysis
-boundaries. It deliberately does not select a delete, rename, or preserve
-repair action; that policy belongs to PCART.
+Reusing an `AnalysisContext` retains the source index and analysis caches for
+multiple APIs from the same library version. Both scan functions accept
+`max_depth` (default five) and optional `import_roots`. On-demand scans resolve
+the requested API to its source implementation; findings retain the requested
+API identity and the path retains implementation identities.
 
-When PCResolve reports constructor-backed chained receivers, assessment and
-scan findings retain the bounded source target candidates and receiver-type
-evidence. A candidate is not treated as certain runtime dispatch: dynamic
-accessor and method overrides remain explicit uncertainty, and a rejecting
-candidate can establish at most a possible failure.
+The scanner supports functions, methods, `async def`, cross-file imports,
+aliases and bounded multi-hop propagation covered by PCResolve. Passing a
+mapping or sequence as an ordinary parameter is a propagation hop, not a VPP
+by itself; a finding requires an eventual `**mapping` or `*sequence` expansion
+into a signature without the matching variadic parameter. Unresolved targets,
+unsupported propagation, recursion and depth limits remain visible diagnostics.
+Source-candidate paths retain their target status: a finding does not establish
+exact runtime dispatch or prove that a particular client call will fail.
 
-Current assessment support intentionally starts with direct `**kwargs`
-propagation and follows resolved `**kwargs` forwarding across multiple local
-functions. For a concrete call site, a narrow guard proof can also identify
-when the changed keyword is the sole captured key and a known `None` argument
-causes an uncaught, first-statement `if ... and kwargs: raise` branch. It
-supports direct calls and side-effect-free direct forwarding; uncertain values,
-other captured keys, and dynamic or conditional forwarding remain conservative.
-Unresolved targets, unsupported transformations, recursion/depth exhaustion,
-and most element-level `*args` tracking produce explicit `unknown` results and
-analysis boundaries. The default forwarding depth is five and can be set on
-`VPPRequest.max_depth`. `assess_changes()` reuses analysis state for requests
-against the same source version.
+For future PCART integration, an on-demand VPP result can determine whether
+the existing variadic-parameter preservation rule applies. The returned
+Python objects do not select a deletion or rename and do not assess a concrete
+client call's compatibility.
 
 ## Version 1.0 research scanner
 

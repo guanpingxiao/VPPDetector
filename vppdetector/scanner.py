@@ -1,124 +1,112 @@
-"""Standalone package scanner for latent variadic forwarding mismatches."""
+"""Whole-package and on-demand scopes over the same VPP detection core."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
-from .core import (
-    AnalysisContext,
-    ResolutionError,
-    call_span,
-    candidate_identities,
-    direct_calls,
-    forwards_parameter,
-    identity_from_target,
-)
+from .core import AnalysisContext, ResolutionError, scan_function
 from .models import (
     AnalysisBoundary,
-    FindingKind,
     ForwardingFinding,
+    FunctionIdentity,
     ScanReport,
     SourceContext,
     VariadicFunction,
 )
-from .source import SourceIndex, build_source_index
+from .source import IndexedFunction, SourceIndex, build_source_index, normalized_import_roots
 
 PathLike = Union[str, Path]
+ScanSource = Union[PathLike, SourceContext]
 
 
 def scan_package(
-    package_root: PathLike,
+    package_root: ScanSource,
     *,
     import_roots: Optional[Sequence[PathLike]] = None,
+    max_depth: int = 5,
+    context: Optional[AnalysisContext] = None,
 ) -> ScanReport:
-    """Scan one source version for variadic forwarding structures.
+    """Find VPPs in one library version, optionally reusing analysis state."""
 
-    This is intentionally a single-version structural scan. It does not infer
-    API evolution or compare two library releases.
+    _validate_depth(max_depth)
+    index, context = _prepare_context(package_root, import_roots, context)
+    if not index.files:
+        return _empty_source_report(index)
+    entries = tuple(function for function in index.functions if not function.is_overload)
+    return _scan_entries(context, entries, max_depth=max_depth)
+
+
+def scan_api(
+    package_root: ScanSource,
+    target_api: FunctionIdentity,
+    *,
+    import_roots: Optional[Sequence[PathLike]] = None,
+    max_depth: int = 5,
+    context: Optional[AnalysisContext] = None,
+) -> ScanReport:
+    """Find VPPs reachable from one API without assessing a client call.
+
+    API identity resolution may follow imports, aliases and inherited methods.
+    The requested API stays attached to findings while path steps identify the
+    actual source implementations.
     """
 
-    source = SourceContext(
-        package_root=Path(package_root),
-        import_roots=tuple(Path(path) for path in (import_roots or ())),
-    )
-    index = build_source_index(source)
+    _validate_depth(max_depth)
+    index, context = _prepare_context(package_root, import_roots, context)
     if not index.files:
-        boundary = AnalysisBoundary(
-            code="no_python_sources",
-            message="No Python source files were found under the package root.",
+        return replace(_empty_source_report(index), target_api=target_api)
+    try:
+        entry = context.resolve_api(target_api)
+    except ResolutionError as exc:
+        return _missing_api_report(index, target_api, "entry_resolution_failed", str(exc))
+    if entry is None or entry.is_overload:
+        return _missing_api_report(
+            index,
+            target_api,
+            "target_api_unavailable",
+            "The requested API could not be resolved to one source implementation.",
         )
-        return ScanReport(
-            source=index.source,
-            functions_scanned=0,
-            variadic_functions=(),
-            findings=(),
-            boundaries=(*index.boundaries, boundary),
-        )
-    context = AnalysisContext.from_index(index)
+    report = _scan_entries(context, (entry,), max_depth=max_depth)
+    return replace(
+        report,
+        target_api=target_api,
+        resolved_api=entry.identity,
+        variadic_functions=tuple(
+            replace(
+                function,
+                function=target_api,
+                implementation=entry.identity if target_api != entry.identity else None,
+            )
+            for function in report.variadic_functions
+        ),
+        findings=tuple(replace(finding, function=target_api) for finding in report.findings),
+    )
+
+
+def _scan_entries(
+    context: AnalysisContext,
+    entries: Sequence[IndexedFunction],
+    *,
+    max_depth: int,
+) -> ScanReport:
     variadic_functions: List[VariadicFunction] = []
     findings: List[ForwardingFinding] = []
-    boundaries: List[AnalysisBoundary] = list(index.boundaries)
+    boundaries: List[AnalysisBoundary] = list(context.index.boundaries)
     schema_version: Optional[str] = None
-
-    for function in index.functions:
-        if function.is_overload or not function.variadic_parameters:
+    for entry in entries:
+        if not entry.variadic_parameters:
             continue
-        variadic_functions.append(VariadicFunction(function.identity, function.variadic_parameters))
-        try:
-            analysis = context.adapter.analyze(function.identity, max_depth=1)
-        except ResolutionError as exc:
-            boundaries.append(
-                AnalysisBoundary(
-                    code="entry_resolution_failed",
-                    message=str(exc),
-                    function=function.identity,
-                )
-            )
-            continue
-        schema_version = analysis.schema_version
-        for call in direct_calls(analysis, function.identity):
-            for parameter_name, parameter_kind in function.variadic_parameters:
-                if not forwards_parameter(call, parameter_name, parameter_kind):
-                    continue
-                target_identity = identity_from_target(call.target) if call.target else None
-                target_candidates = candidate_identities(call)
-                target_definition = _target_definition(index, target_identity)
-                ambiguity = _target_ambiguity(analysis, call.id)
-                if target_definition is None:
-                    if target_candidates:
-                        kind = FindingKind.AMBIGUOUS_TARGET
-                        reason_code = "source_target_candidates_only"
-                    else:
-                        kind = FindingKind.UNRESOLVED_TARGET
-                        reason_code = "target_definition_unavailable"
-                elif ambiguity:
-                    kind = FindingKind.AMBIGUOUS_TARGET
-                    reason_code = "pcresolve_{}".format(ambiguity)
-                elif target_definition.signature.accepts_variadic(parameter_kind):
-                    kind = FindingKind.FORWARDING_ACCEPTED_BY_VARIADIC
-                    reason_code = "target_accepts_corresponding_variadic_parameter"
-                else:
-                    kind = FindingKind.LATENT_ACCEPTANCE_MISMATCH
-                    reason_code = "target_lacks_corresponding_variadic_parameter"
-                findings.append(
-                    ForwardingFinding(
-                        function=function.identity,
-                        parameter_name=parameter_name,
-                        parameter_kind=parameter_kind,
-                        callee_expression=call.callee_name,
-                        callsite=call_span(call),
-                        target=target_identity,
-                        kind=kind,
-                        reason_code=reason_code,
-                        target_candidates=target_candidates,
-                        receiver_type_evidence=tuple(getattr(call, "receiver_type_evidence", ())),
-                    )
-                )
-
+        variadic_functions.append(VariadicFunction(entry.identity, entry.variadic_parameters))
+        entry_findings, entry_boundaries, entry_schema = scan_function(context, entry, max_depth)
+        findings.extend(entry_findings)
+        boundaries.extend(entry_boundaries)
+        if entry_schema is not None:
+            schema_version = entry_schema
     return ScanReport(
-        source=index.source,
-        functions_scanned=len(index.functions),
+        source=context.index.source,
+        functions_scanned=len(entries),
         variadic_functions=tuple(variadic_functions),
         findings=tuple(findings),
         boundaries=tuple(boundaries),
@@ -126,22 +114,65 @@ def scan_package(
     )
 
 
-def _target_definition(index: SourceIndex, target: object):
-    if target is None or target.file_path is None or target.lineno is None:
-        return None
-    return index.find_by_location(target.file_path, target.lineno)
+def _prepare_context(
+    package_root: ScanSource,
+    import_roots: Optional[Sequence[PathLike]],
+    context: Optional[AnalysisContext],
+) -> tuple[SourceIndex, Optional[AnalysisContext]]:
+    if isinstance(package_root, SourceContext):
+        source = package_root
+        if import_roots is not None:
+            source = replace(source, import_roots=tuple(Path(path) for path in import_roots))
+    else:
+        source = SourceContext(
+            package_root=Path(package_root),
+            import_roots=tuple(Path(path) for path in (import_roots or ())),
+        )
+    if context is not None:
+        expected = SourceContext(source.package_root.resolve(), normalized_import_roots(source))
+        actual = context.index.source
+        if (
+            actual.package_root.resolve() != expected.package_root
+            or normalized_import_roots(actual) != expected.import_roots
+        ):
+            raise ValueError("Analysis context must use the requested source root and import roots")
+        return context.index, context
+    index = build_source_index(source)
+    return index, AnalysisContext.from_index(index) if index.files else None
 
 
-def _target_ambiguity(analysis: object, call_id: str) -> Optional[str]:
-    handled_reasons = {
-        "depth_limit",
-        "dynamic_argument_expansion",
-        "invalid_argument_binding",
-    }
-    for boundary in analysis.boundaries:
-        if boundary.get("call_id") != call_id:
-            continue
-        reason = boundary.get("reason", "analyzer_boundary")
-        if reason not in handled_reasons:
-            return reason
-    return None
+def _validate_depth(max_depth: int) -> None:
+    if isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 1:
+        raise ValueError("max_depth must be a positive integer")
+
+
+def _empty_source_report(index: SourceIndex) -> ScanReport:
+    return ScanReport(
+        source=index.source,
+        functions_scanned=0,
+        variadic_functions=(),
+        findings=(),
+        boundaries=(
+            *index.boundaries,
+            AnalysisBoundary(
+                code="no_python_sources",
+                message="No Python source files were found under the package root.",
+            ),
+        ),
+    )
+
+
+def _missing_api_report(
+    index: SourceIndex, target_api: FunctionIdentity, code: str, message: str
+) -> ScanReport:
+    return ScanReport(
+        source=index.source,
+        functions_scanned=0,
+        variadic_functions=(),
+        findings=(),
+        boundaries=(
+            *index.boundaries,
+            AnalysisBoundary(code=code, message=message, function=target_api),
+        ),
+        target_api=target_api,
+    )

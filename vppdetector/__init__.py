@@ -1,48 +1,35 @@
-"""Incubation API shared by the VPP scanner and compatibility refinement."""
+"""Whole-library and on-demand VPP detection backed by PCResolve facts."""
 
-from .assessment import assess_change, assess_changes
+from .core import AnalysisContext, ResolutionError
 from .encoding import get_encoding, getEncoding
 from .models import (
     AnalysisBoundary,
-    ArgumentEffect,
-    BindingStatus,
-    CallSite,
-    ChangeKind,
-    EntryBinding,
-    FindingKind,
     ForwardingFinding,
+    ForwardingStep,
     FunctionIdentity,
-    ParameterChange,
     ScanReport,
     SourceContext,
+    SourceSpan,
+    VariadicFunction,
     VariadicKind,
-    Verdict,
-    VPPAssessment,
-    VPPRequest,
 )
-from .scanner import scan_package
+from .scanner import scan_api, scan_package
 
 __all__ = [
     "AnalysisBoundary",
-    "ArgumentEffect",
-    "BindingStatus",
-    "CallSite",
-    "ChangeKind",
-    "EntryBinding",
-    "FindingKind",
+    "AnalysisContext",
     "ForwardingFinding",
+    "ForwardingStep",
     "FunctionIdentity",
-    "ParameterChange",
+    "ResolutionError",
     "ScanReport",
     "SourceContext",
-    "VPPAssessment",
-    "VPPRequest",
+    "SourceSpan",
+    "VariadicFunction",
     "VariadicKind",
-    "Verdict",
-    "assess_change",
-    "assess_changes",
     "getEncoding",
     "get_encoding",
+    "scan_api",
     "scan_package",
 ]
 

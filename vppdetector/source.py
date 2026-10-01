@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import tokenize
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -20,32 +20,16 @@ class SignatureFacts:
     keyword_only: Tuple[str, ...]
     vararg: Optional[str]
     kwarg: Optional[str]
-    required_positional: Tuple[str, ...]
-    required_keyword_only: Tuple[str, ...]
 
     @classmethod
     def from_arguments(cls, arguments: ast.arguments) -> "SignatureFacts":
-        positional = (*arguments.posonlyargs, *arguments.args)
-        required_count = len(positional) - len(arguments.defaults)
         return cls(
             positional_only=tuple(arg.arg for arg in arguments.posonlyargs),
             positional_or_keyword=tuple(arg.arg for arg in arguments.args),
             keyword_only=tuple(arg.arg for arg in arguments.kwonlyargs),
             vararg=arguments.vararg.arg if arguments.vararg else None,
             kwarg=arguments.kwarg.arg if arguments.kwarg else None,
-            required_positional=tuple(arg.arg for arg in positional[:required_count]),
-            required_keyword_only=tuple(
-                arg.arg
-                for arg, default in zip(arguments.kwonlyargs, arguments.kw_defaults)
-                if default is None
-            ),
         )
-
-    def accepts_keyword(self, name: str) -> bool:
-        return bool(self.kwarg or self.explicitly_accepts_keyword(name))
-
-    def explicitly_accepts_keyword(self, name: str) -> bool:
-        return name in self.positional_or_keyword or name in self.keyword_only
 
     def accepts_variadic(self, kind: VariadicKind) -> bool:
         if kind is VariadicKind.KEYWORD:
@@ -84,6 +68,8 @@ class SourceIndex:
     functions: Tuple[IndexedFunction, ...]
     constructors: Tuple[IndexedConstructor, ...]
     boundaries: Tuple[AnalysisBoundary, ...]
+    imports: dict = field(default_factory=dict)
+    _definition_index: object = field(default=None, init=False, repr=False)
 
     def find(self, identity: FunctionIdentity) -> Optional[IndexedFunction]:
         requested_path = identity.file_path.resolve() if identity.file_path else None
@@ -109,6 +95,58 @@ class SourceIndex:
             if len(implementations) == 1:
                 candidates = implementations
         return candidates[0] if len(candidates) == 1 else None
+
+    def resolve_imported(self, identity: FunctionIdentity) -> Optional[IndexedFunction]:
+        """Resolve an exact import-backed API or source class through PCResolve."""
+
+        if identity.file_path or identity.lineno:
+            constructors = [
+                item.function
+                for item in self.constructors
+                if item.class_identity.module == identity.module
+                and item.class_identity.qualname == identity.qualname
+                and (
+                    not identity.file_path
+                    or item.class_identity.file_path
+                    and item.class_identity.file_path.resolve() == identity.file_path.resolve()
+                )
+                and (not identity.lineno or item.class_identity.lineno == identity.lineno)
+            ]
+            return constructors[0] if len(constructors) == 1 else None
+
+        if self._definition_index is None:
+            from pcresolve.call_resolution import DefinitionIndex, DefinitionRecord
+
+            grouped = {}
+            for function in self.functions:
+                key = (function.identity.module, function.identity.qualname)
+                grouped.setdefault(key, []).append(function)
+            records = []
+            for (module, qualname), functions in grouped.items():
+                implementations = [function for function in functions if not function.is_overload]
+                selected = implementations if len(implementations) == 1 else functions
+                records.extend(
+                    DefinitionRecord(module, qualname, function) for function in selected
+                )
+            records.extend(
+                DefinitionRecord(
+                    item.class_identity.module,
+                    item.class_identity.qualname,
+                    item.function,
+                    kind="class",
+                )
+                for item in self.constructors
+            )
+            self._definition_index = DefinitionIndex(records)
+
+        function = self._definition_index.resolve_name(
+            identity.module, "", identity.qualname, self.imports
+        )
+        if function is not None:
+            return function
+        return self._definition_index.resolve_name(
+            identity.module, "", identity.qualname, self.imports, kind="class"
+        )
 
     def find_by_location(self, file_path: Path, lineno: int) -> Optional[IndexedFunction]:
         resolved = file_path.resolve()
@@ -139,6 +177,14 @@ class _FunctionCollector(ast.NodeVisitor):
         self.scope_kinds: List[str] = []
         self.functions: List[IndexedFunction] = []
         self.constructors: List[IndexedConstructor] = []
+
+    def generic_visit(self, node: ast.AST) -> None:
+        # Definitions live in statement structure, not inside expressions.
+        # Traversing giant expression trees adds no API facts and can overflow
+        # Python's recursion limit even when the source parses successfully.
+        for child in ast.iter_child_nodes(node):
+            if not isinstance(child, ast.expr):
+                self.visit(child)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         class_qualname = ".".join((*self.scope, node.name))
@@ -217,6 +263,9 @@ class _FunctionCollector(ast.NodeVisitor):
 
 
 def build_source_index(source: SourceContext) -> SourceIndex:
+    from pcresolve.import_facts import import_facts, resolve_relative_module
+    from pcresolve.scope_facts import statement_scope_facts
+
     root = source.package_root.resolve()
     if not root.exists():
         raise FileNotFoundError("Package root does not exist: {}".format(root))
@@ -226,6 +275,7 @@ def build_source_index(source: SourceContext) -> SourceIndex:
     functions: List[IndexedFunction] = []
     constructors: List[IndexedConstructor] = []
     boundaries: List[AnalysisBoundary] = []
+    imports = {}
 
     for file_path in files:
         try:
@@ -240,6 +290,36 @@ def build_source_index(source: SourceContext) -> SourceIndex:
             )
             continue
         module = module_name_for_path(file_path, import_roots)
+        aliases = {}
+        imported_bindings = {}
+        rebound = set()
+        for statement in tree.body:
+            facts = import_facts(statement)
+            if not facts:
+                rebound.update(statement_scope_facts([statement]).bound)
+            for fact in facts:
+                imported_bindings[fact.python_binding] = (
+                    imported_bindings.get(fact.python_binding, 0) + 1
+                )
+                if fact.kind == "import":
+                    aliases[fact.python_binding] = fact.name if fact.asname else fact.python_binding
+                else:
+                    prefix = (
+                        resolve_relative_module(
+                            module,
+                            file_path.name.startswith("__init__."),
+                            fact.module,
+                            fact.level,
+                        )
+                        if fact.level
+                        else fact.module
+                    )
+                    aliases[fact.python_binding] = prefix + "." + fact.name
+        imports[module] = {
+            name: target
+            for name, target in aliases.items()
+            if name not in rebound and imported_bindings[name] == 1
+        }
         collector = _FunctionCollector(module, file_path)
         collector.visit(tree)
         functions.extend(collector.functions)
@@ -251,6 +331,7 @@ def build_source_index(source: SourceContext) -> SourceIndex:
         functions=tuple(functions),
         constructors=tuple(constructors),
         boundaries=tuple(boundaries),
+        imports=imports,
     )
 
 
@@ -283,27 +364,6 @@ def module_name_for_path(file_path: Path, import_roots: Sequence[Path]) -> str:
     return file_path.stem
 
 
-def parameter_is_mutated(function: IndexedFunction, parameter: str) -> bool:
-    """Return true for mutations that make element-level forwarding uncertain."""
-
-    for node in _function_body_nodes(function.node):
-        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Delete)):
-            targets: Iterable[ast.AST]
-            if isinstance(node, ast.Assign):
-                targets = node.targets
-            elif isinstance(node, ast.Delete):
-                targets = node.targets
-            else:
-                targets = (node.target,)
-            if any(_targets_parameter(target, parameter) for target in targets):
-                return True
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if isinstance(node.func.value, ast.Name) and node.func.value.id == parameter:
-                if node.func.attr in {"clear", "pop", "popitem", "setdefault", "update"}:
-                    return True
-    return False
-
-
 def _python_files(root: Path) -> Iterable[Path]:
     if root.is_file():
         if root.suffix in {".py", ".pyi"}:
@@ -327,27 +387,3 @@ def _decorator_name(node: ast.AST) -> str:
 
 def _is_overload_decorator(node: ast.AST) -> bool:
     return _decorator_name(node).split(".")[-1] == "overload"
-
-
-def _function_body_nodes(function: FunctionNode) -> Iterable[ast.AST]:
-    pending = list(reversed(function.body))
-    while pending:
-        node = pending.pop()
-        yield node
-        if isinstance(
-            node,
-            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
-        ):
-            continue
-        pending.extend(reversed(list(ast.iter_child_nodes(node))))
-
-
-def _targets_parameter(node: ast.AST, parameter: str) -> bool:
-    if isinstance(node, ast.Name):
-        return node.id == parameter
-    if isinstance(node, (ast.Attribute, ast.Subscript)):
-        value = node.value
-        return isinstance(value, ast.Name) and value.id == parameter
-    if isinstance(node, (ast.Tuple, ast.List)):
-        return any(_targets_parameter(item, parameter) for item in node.elts)
-    return False
