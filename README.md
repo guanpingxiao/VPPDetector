@@ -100,6 +100,10 @@ into a signature without the matching variadic parameter. Unresolved targets,
 unsupported propagation, recursion and depth limits remain visible diagnostics.
 Unknown effects on returned containers and transformations without open-shape
 facts (including comprehensions, copies and slices) remain analysis boundaries.
+When PCResolve proves a decorated callable's identity but leaves its effects
+unmodeled, the scanner does not use that callee's body to prove container returns
+or further forwarding. Direct expansion findings against its nominal signature
+retain the effects diagnostic; they do not assert that decoration was effect-free.
 Source-candidate paths retain their target status: a finding does not establish
 exact runtime dispatch or prove that a particular client call will fail.
 

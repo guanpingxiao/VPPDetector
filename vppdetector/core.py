@@ -335,6 +335,10 @@ def scan_function(
                             )
                         )
                         continue
+                    body_boundaries = _callee_body_boundaries(analysis, call)
+                    if body_boundaries:
+                        boundaries.extend(body_boundaries)
+                        continue
                     if len(path) >= max_depth:
                         boundaries.append(
                             AnalysisBoundary(
@@ -521,6 +525,10 @@ def _returned_flows(
                     "No exact source target for container return.",
                     producer,
                 )
+                continue
+            body_boundaries = _callee_body_boundaries(owner_analysis, producer)
+            if body_boundaries:
+                boundaries.extend(body_boundaries)
                 continue
             target = identity_from_target(producer.target)
             definition = _target_definition(context, target)
@@ -743,6 +751,29 @@ def _target_status(analysis: Any, call: Any) -> str:
     ):
         return "source_candidate"
     return "resolved"
+
+
+def _callee_body_boundaries(analysis: Any, call: Any) -> tuple[AnalysisBoundary, ...]:
+    """Callable identity does not prove an effect-uncertain body is unchanged."""
+
+    reason = "identity_decorator_effects_unmodeled"
+    if not any(
+        boundary.get("call_id") == call.id and boundary.get("reason") == reason
+        for boundary in analysis.boundaries
+    ):
+        return ()
+    identity, span = identity_from_target(call.caller), call_span(call)
+    return (
+        AnalysisBoundary(
+            "callee_body_effects_unmodeled",
+            "Unmodeled decorator effects prevent using the callee body for propagation.",
+            identity,
+            span,
+        ),
+        AnalysisBoundary(
+            "pcresolve_" + reason, "PCResolve boundary: {}.".format(reason), identity, span
+        ),
+    )
 
 
 def _analysis_boundaries(
