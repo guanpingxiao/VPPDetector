@@ -36,6 +36,7 @@ class PCResolveAdapter:
             import_roots=index.source.import_roots,
         )
         self._analysis_cache = {}
+        self._expansion_cache = {}
 
     def analyze(self, function: FunctionIdentity, max_depth: int = 1) -> Any:
         from pcresolve import FunctionRef
@@ -56,6 +57,22 @@ class PCResolveAdapter:
             raise ResolutionError(str(exc)) from exc
         self._analysis_cache[cache_key] = analysis
         return analysis
+
+    def expand(self, analysis: Any, call_id: str) -> Any:
+        """Expand one exact edge, retaining its incoming receiver facts."""
+
+        cache_key = (id(analysis), call_id)
+        cached = self._expansion_cache.get(cache_key)
+        if cached is not None:
+            return cached[1]
+        try:
+            expanded = self._analyzer.expand(analysis, call_id, additional_depth=1)
+        except (KeyError, RuntimeError, StopIteration, ValueError) as exc:
+            raise ResolutionError(str(exc)) from exc
+        # Retain the input too: an object id must not be reused for a different
+        # receiver snapshot while an expansion is cached.
+        self._expansion_cache[cache_key] = (analysis, expanded)
+        return expanded
 
 
 @dataclass
@@ -161,6 +178,7 @@ class _State:
     kind: VariadicKind
     path: Tuple[ForwardingStep, ...] = ()
     ancestry: tuple = ()
+    analysis: Any = field(default=None, compare=False, repr=False)
 
 
 def scan_function(
@@ -183,16 +201,16 @@ def scan_function(
     while pending:
         state = pending.pop(0)
         identity = state.function.identity
-        state_key = (identity, state.parameter, state.kind)
+        try:
+            analysis = state.analysis or context.adapter.analyze(identity)
+        except ResolutionError as exc:
+            boundaries.append(AnalysisBoundary("flow_analysis_failed", str(exc), identity))
+            continue
+        state_key = (identity, state.parameter, state.kind, _receiver_contexts(analysis, identity))
         if state_key in state.ancestry:
             boundaries.append(
                 AnalysisBoundary("recursive_forwarding", "Recursive forwarding path.", identity)
             )
-            continue
-        try:
-            analysis = context.adapter.analyze(identity)
-        except ResolutionError as exc:
-            boundaries.append(AnalysisBoundary("flow_analysis_failed", str(exc), identity))
             continue
         schema = getattr(analysis, "schema_version", schema)
         relevant_calls = set()
@@ -349,6 +367,15 @@ def scan_function(
                             )
                         )
                         continue
+                    try:
+                        child = _expand_body(context, analysis, call, definition)
+                    except ResolutionError as exc:
+                        boundaries.append(
+                            AnalysisBoundary(
+                                "forwarding_context_unavailable", str(exc), identity, span
+                            )
+                        )
+                        continue
                     next_state = _State(
                         definition,
                         next_parameter,
@@ -356,6 +383,7 @@ def scan_function(
                         state.kind,
                         path,
                         (*state.ancestry, state_key),
+                        child,
                     )
                     if next_state not in pending:
                         pending.append(next_state)
@@ -363,6 +391,85 @@ def scan_function(
     result = (tuple(findings), tuple(dict.fromkeys(boundaries)), schema)
     context._scan_cache[cache_key] = result
     return result
+
+
+def _receiver_contexts(analysis: Any, identity: FunctionIdentity) -> tuple:
+    """A source owner's contexts, not a proof that unknown contexts are absent."""
+
+    return tuple(
+        identity_from_target(receiver)
+        for summary in analysis.functions
+        if identity_from_target(summary["function"]) == identity
+        for receiver in summary.get("receiver_contexts", ())
+    )
+
+
+def _expand_body(
+    context: AnalysisContext, analysis: Any, call: Any, definition: IndexedFunction
+) -> Any:
+    """Expand class-dependent edges; retain neutral candidate-body analysis."""
+
+    if call.binding_status == "invalid":
+        raise ResolutionError("No usable call binding for callee-body propagation.")
+    required = (
+        call.target_status in {"classmethod", "super_new"}
+        or definition.node.name == "__new__" and any(
+            owner.module == definition.identity.module
+            and owner.file_path == definition.identity.file_path
+            and definition.identity.qualname == owner.qualname + ".__new__"
+            for owner in context.index.classes
+        )
+    )
+    if not required:
+        neutral = context.adapter.analyze(definition.identity)
+        required = bool(_receiver_contexts(neutral, definition.identity))
+        if not required:
+            # Instance-method source candidates and ordinary helpers retain
+            # the existing nominal body analysis. Never use this fallback for
+            # a missing class receiver context.
+            return neutral
+    if (
+        call.target is None
+        or identity_from_target(call.target) != definition.identity
+        or any(target != definition.identity for target in candidate_identities(call))
+    ):
+        raise ResolutionError("No unique usable call edge for callee-body propagation.")
+    child = context.adapter.expand(analysis, call.id)
+    summaries = [
+        summary for summary in child.functions
+        if identity_from_target(summary["function"]) == definition.identity
+    ]
+    if len(summaries) != 1:
+        raise ResolutionError("Callee-body expansion is unavailable or budget-limited.")
+    receivers = _receiver_contexts(child, definition.identity)
+    if len(receivers) > 1:
+        raise ResolutionError("Mixed class receiver contexts cannot prove one forwarding path.")
+    # Unknown contexts may be absent from receiver_contexts. Validate every
+    # actual incoming receiver value, including the explicit first formal of
+    # __new__, rather than treating a single listed class as complete proof.
+    if not receivers:
+        raise ResolutionError("Incoming class receiver facts are incomplete or conflicting.")
+    positional = (
+        *definition.signature.positional_only, *definition.signature.positional_or_keyword
+    )
+    values = [
+        value
+        for argument in call.argument_sources
+        if positional and argument.get("parameter") == positional[0]
+        for value in argument.get("sources", ())
+    ]
+    if not values or any(
+        not value.get("class_type")
+        or identity_from_target(value["class_type"]) != receivers[0]
+        or value.get("relation") != "direct"
+        or value.get("projection") or value.get("output_path")
+        or any(value.get(flag) for flag in (
+            "value_incomplete", "import_incomplete", "import_modified"
+        ))
+        for value in values
+    ):
+        raise ResolutionError("Incoming class receiver facts are incomplete or conflicting.")
+    return child
 
 
 def _parameters(function: IndexedFunction) -> tuple:
@@ -550,9 +657,16 @@ def _returned_flows(
                 )
                 continue
             try:
-                child = context.adapter.analyze(definition.identity)
+                child = _expand_body(context, owner_analysis, producer, definition)
             except ResolutionError as exc:
                 boundary("return_analysis_failed", str(exc), producer)
+                continue
+            if _receiver_contexts(child, definition.identity):
+                boundary(
+                    "return_context_unavailable",
+                    "Class-context container return composition is not supported.",
+                    producer,
+                )
                 continue
             bindings = tuple(
                 CallBinding(
@@ -786,6 +900,12 @@ def _analysis_boundaries(
         # expansion elements are its input, not concrete client-binding errors.
         if reason in {"depth_limit", "dynamic_argument_expansion"}:
             continue
+        owner = boundary.get("function")
+        if owner and identity_from_target(owner) != identity:
+            continue
+        if not owner and not boundary.get("call_id"):
+            if identity_from_target(analysis.entry) != identity:
+                continue
         call_id = boundary.get("call_id")
         if call_id and call_id not in relevant_calls:
             if call_id not in calls or reason not in {

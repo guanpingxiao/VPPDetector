@@ -93,8 +93,11 @@ aliases, public class re-exports, inherited methods and source constructor
 entries (`__init__`, otherwise `__new__`). Ambiguous constructor definitions
 are not replaced with a guessed entry. Bounded multi-hop propagation includes
 source-resolved helpers returning a whole container; the evidence path retains
-those return-producing calls, and they count toward `max_depth`. Passing a
-mapping or sequence as an ordinary parameter is a propagation hop, not a VPP
+those return-producing calls, and they count toward `max_depth`. Classmethod and
+`__new__` helper forwarding retains source-proven incoming PCResolve receiver
+contexts. Missing or mixed receiver facts remain boundaries; mutable configuration
+attributes and class-context container returns are not inferred. Passing a mapping
+or sequence as an ordinary parameter is a propagation hop, not a VPP
 by itself; a finding requires an eventual `**mapping` or `*sequence` expansion
 into a signature without the matching variadic parameter. Unresolved targets,
 unsupported propagation, recursion and depth limits remain visible diagnostics.
