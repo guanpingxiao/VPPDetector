@@ -227,6 +227,11 @@ to proceed past a supported unrelated error-only guard. It is not an observed
 guard value. The result then describes parameter handling on that normal path;
 see [normal-path preconditions](analysis-limits.md#normal-path-preconditions).
 
+Evidence with reason `source_classmethod_binding` records PCResolve's
+source-snapshot assumptions for static classmethod signature binding. It does
+not represent an observed runtime target; see
+[binding evidence](analysis-limits.md#supplied-call-facts).
+
 See [assessment states](analysis-limits.md#assessment-states) for the meaning
 of each result.
 

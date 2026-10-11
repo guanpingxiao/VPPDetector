@@ -154,7 +154,15 @@ unresolved assessment.
 
 Additional facts must describe the supplied call and source version. A nominal
 PCResolve candidate does not independently confirm a runtime target; uncertain
-class dispatch remains `UNKNOWN` without independent evidence.
+class dispatch remains `UNKNOWN` without supporting binding evidence.
+
+For a built-in classmethod, a PCResolve `source_bound` fact can establish static
+signature binding under its source-snapshot assumptions. The target, implicit
+receiver and all incoming analysis contexts must agree, with no binding issues
+or remaining dispatch uncertainty. The assessment records those assumptions as
+`source_classmethod_binding` evidence; this is not runtime target confirmation.
+Visible rebinding, incomplete mutation analysis and conflicting contexts remain
+unresolved. This does not authorize bypassing decorated helper bodies.
 
 The analyzer does not execute client argument expressions or load runtime
 object graphs. Context caches retain program facts, while each assessment
