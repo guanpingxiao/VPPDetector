@@ -11,8 +11,10 @@ from .models import (
     AnalysisBoundary,
     ForwardingFinding,
     FunctionIdentity,
+    ScanCoverageStatus,
     ScanReport,
     SourceContext,
+    VariadicCoverage,
     VariadicFunction,
 )
 from .source import IndexedFunction, SourceIndex, build_source_index, normalized_import_roots
@@ -84,6 +86,18 @@ def scan_api(
             for function in report.variadic_functions
         ),
         findings=tuple(replace(finding, function=target_api) for finding in report.findings),
+        boundaries=tuple(
+            replace(boundary, root_function=target_api)
+            if boundary.root_function == entry.identity else boundary
+            for boundary in report.boundaries
+        ),
+        coverage=tuple(
+            replace(
+                channel, function=target_api,
+                implementation=entry.identity if target_api != entry.identity else None,
+            )
+            for channel in report.coverage
+        ),
     )
 
 
@@ -96,6 +110,7 @@ def _scan_entries(
     variadic_functions: List[VariadicFunction] = []
     findings: List[ForwardingFinding] = []
     boundaries: List[AnalysisBoundary] = list(context.index.boundaries)
+    coverage: List[VariadicCoverage] = []
     schema_version: Optional[str] = None
     for entry in entries:
         if not entry.variadic_parameters:
@@ -104,6 +119,26 @@ def _scan_entries(
         entry_findings, entry_boundaries, entry_schema = scan_function(context, entry, max_depth)
         findings.extend(entry_findings)
         boundaries.extend(entry_boundaries)
+        for name, kind in entry.variadic_parameters:
+            channel_boundaries = (
+                *context.index.boundaries,
+                *(boundary for boundary in entry_boundaries
+                  if boundary.parameter_name == name and boundary.parameter_kind == kind),
+            )
+            unavailable = any(
+                boundary.code == "flow_analysis_failed" and boundary.function == entry.identity
+                for boundary in channel_boundaries
+            )
+            status = (
+                ScanCoverageStatus.UNAVAILABLE if unavailable else
+                ScanCoverageStatus.LIMITED if channel_boundaries else
+                ScanCoverageStatus.NO_KNOWN_BOUNDARY
+            )
+            coverage.append(VariadicCoverage(
+                entry.identity, name, kind, status,
+                sum(f.parameter_name == name and f.parameter_kind == kind for f in entry_findings),
+                tuple(dict.fromkeys(boundary.code for boundary in channel_boundaries)),
+            ))
         if entry_schema is not None:
             schema_version = entry_schema
     return ScanReport(
@@ -113,6 +148,7 @@ def _scan_entries(
         findings=tuple(findings),
         boundaries=tuple(boundaries),
         analyzer_schema_version=schema_version,
+        coverage=tuple(coverage),
     )
 
 

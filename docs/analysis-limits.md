@@ -12,6 +12,19 @@ into a downstream signature without the corresponding variadic parameter.
 other analysis limits. An empty findings collection means no VPP was detected
 within the supported analysis; inspect the boundaries to understand coverage.
 
+`coverage` summarizes findings and recorded limits for each root `*args` or
+`**kwargs` channel. Its status is `unavailable` for a root analysis failure,
+`limited` when a boundary is recorded, or `no_known_boundary` when none is
+recorded. No status certifies complete coverage. A finding and a limitation
+can coexist; neither the absence of findings nor the absence of recorded
+boundaries proves that no propagation exists.
+
+Channel-specific scan boundaries identify `root_function`, `parameter_name`
+and `parameter_kind`, while `function` and `callsite` identify the stopping
+point, which may be in a downstream helper. Source-scope failures apply to
+all considered channels. Missing source/API entries remain report-level
+boundaries without fabricated coverage records.
+
 Findings and forwarding steps retain `target_status`. A source candidate
 identifies a potential implementation rather than confirmed runtime dispatch.
 Structural findings therefore describe forwarding patterns, not the failure
@@ -72,6 +85,15 @@ a structural finding, retaining the effects diagnostic.
 Unknown effects on returned containers and transformations without open-shape
 facts remain boundaries. Examples include comprehensions, copies and slices
 when the required shape facts are unavailable.
+
+Carrier receiver operations preserve PCResolve's specific effect diagnostics
+even when no ordinary argument flow was produced. Locally resolved callables
+with captured channel dependencies report `closure_capture_not_followed`;
+returned local callables with lexical captures report
+`deferred_callable_not_followed`. These diagnostics describe unmodeled
+propagation, not newly established forwarding paths. Lexical capture does
+not prove the current captured value, and returned-callable execution is
+outside the immediate scan path. Shadowed local parameters are not captures.
 
 Unresolved targets, unsupported propagation, recursion and depth limits also
 remain visible diagnostics. The default depth limit is five hops;

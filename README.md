@@ -15,6 +15,8 @@ VPPDetector provides three Python interfaces:
 
 Scan results contain findings and analysis boundaries. An empty findings
 collection means no VPP was detected within the supported analysis.
+The `coverage` collection summarizes recorded limits separately for each
+variadic channel; `no_known_boundary` does not certify complete coverage.
 
 ## Requirements
 

@@ -35,6 +35,14 @@ class ParameterState(StringEnum):
     UNKNOWN = "unknown"
 
 
+class ScanCoverageStatus(StringEnum):
+    """Observed analysis limits, never a proof of complete coverage."""
+
+    NO_KNOWN_BOUNDARY = "no_known_boundary"
+    LIMITED = "limited"
+    UNAVAILABLE = "unavailable"
+
+
 @dataclass(frozen=True)
 class ParameterChange:
     """One parameter deletion or rename supplied by the caller."""
@@ -129,6 +137,9 @@ class AnalysisBoundary:
     message: str
     function: Optional[FunctionIdentity] = None
     callsite: Optional[SourceSpan] = None
+    root_function: Optional[FunctionIdentity] = None
+    parameter_name: Optional[str] = None
+    parameter_kind: Optional[VariadicKind] = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +205,19 @@ class ForwardingFinding:
 
 
 @dataclass(frozen=True)
+class VariadicCoverage:
+    """One root channel's findings and recorded limits in a scan snapshot."""
+
+    function: FunctionIdentity
+    parameter_name: str
+    parameter_kind: VariadicKind
+    status: ScanCoverageStatus
+    finding_count: int = 0
+    boundary_codes: Tuple[str, ...] = ()
+    implementation: Optional[FunctionIdentity] = None
+
+
+@dataclass(frozen=True)
 class ScanReport:
     """Positive VPP findings and diagnostics for one scan scope."""
 
@@ -205,6 +229,7 @@ class ScanReport:
     analyzer_schema_version: Optional[str] = None
     target_api: Optional[FunctionIdentity] = None
     resolved_api: Optional[FunctionIdentity] = None
+    coverage: Tuple[VariadicCoverage, ...] = ()
 
     @property
     def has_vpp(self) -> bool:

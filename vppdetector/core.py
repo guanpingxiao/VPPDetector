@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple
 
@@ -217,21 +217,38 @@ def scan_function(
     schema = None
     while pending:
         state = pending.pop(0)
+        boundary_start = len(boundaries)
         identity = state.function.identity
         try:
             analysis = state.analysis or context.adapter.analyze(identity)
         except ResolutionError as exc:
-            boundaries.append(AnalysisBoundary("flow_analysis_failed", str(exc), identity))
+            boundaries.append(_root_boundary(
+                AnalysisBoundary("flow_analysis_failed", str(exc), identity), entry, state
+            ))
             continue
         state_key = (identity, state.parameter, state.kind, _receiver_contexts(analysis, identity))
         if state_key in state.ancestry:
             boundaries.append(
-                AnalysisBoundary("recursive_forwarding", "Recursive forwarding path.", identity)
+                _root_boundary(
+                    AnalysisBoundary(
+                        "recursive_forwarding", "Recursive forwarding path.", identity
+                    ),
+                    entry, state,
+                )
             )
             continue
         schema = getattr(analysis, "schema_version", schema)
         relevant_calls = set()
         for call in direct_calls(analysis, identity):
+            if _call_depends_on_parameter(call, state.parameter):
+                relevant_calls.add(call.id)
+            if _call_captures_parameter(context, state, call):
+                relevant_calls.add(call.id)
+                boundaries.append(AnalysisBoundary(
+                    "closure_capture_not_followed",
+                    "A local callable captures this carrier; closure propagation is not followed.",
+                    identity, call_span(call),
+                ))
             object_arguments = [
                 item.get("argument")
                 for item in call.argument_sources
@@ -413,10 +430,111 @@ def scan_function(
                     )
                     if next_state not in pending:
                         pending.append(next_state)
-        boundaries.extend(_analysis_boundaries(analysis, identity, relevant_calls))
+        boundaries.extend(_deferred_capture_boundaries(context, analysis, state))
+        boundaries.extend(_analysis_boundaries(analysis, identity, relevant_calls, state.parameter))
+        boundaries[boundary_start:] = [
+            _root_boundary(boundary, entry, state) for boundary in boundaries[boundary_start:]
+        ]
     result = (tuple(findings), tuple(dict.fromkeys(boundaries)), schema)
     context._scan_cache[cache_key] = result
     return result
+
+
+def _root_boundary(
+    boundary: AnalysisBoundary, entry: IndexedFunction, state: _State
+) -> AnalysisBoundary:
+    return replace(
+        boundary, root_function=entry.identity,
+        parameter_name=state.origin_parameter, parameter_kind=state.kind,
+    )
+
+
+def _parameter_dependency(value: dict, parameter: str) -> bool:
+    """A recorded dependency, without asserting an open container shape."""
+
+    return bool(
+        value.get("kind") in {"parameter", "capture"}
+        and value.get("source", value.get("name")) == parameter
+        or value.get("parameter_container") == parameter
+    )
+
+
+def _call_depends_on_parameter(call: Any, parameter: str) -> bool:
+    values = [*call.receiver_sources, *call.argument_flows]
+    values.extend(value for item in call.argument_sources for value in item.get("sources", ()))
+    values.extend(
+        value for item in getattr(call, "capture_bindings", ())
+        for value in item.get("sources", ())
+    )
+    return any(_parameter_dependency(value, parameter) for value in values)
+
+
+def _lexical_capture(
+    context: AnalysisContext, state: _State, target: FunctionIdentity
+) -> bool:
+    """Use shared scope facts only to diagnose a known local callable.
+
+    Lexical use does not prove the current captured value or a forwarding path.
+    PCResolve still owns runtime target selection and capture value flow.
+    """
+
+    identity = state.function.identity
+    if target.module != identity.module or not target.qualname.startswith(identity.qualname + "."):
+        return False
+    definition = context.index.find(target)
+    if definition is None:
+        return False
+    from pcresolve.scope_facts import captured_names, function_scope_facts
+
+    return state.parameter in captured_names(
+        function_scope_facts(definition.node), (state.parameter,)
+    )
+
+
+def _call_captures_parameter(context: AnalysisContext, state: _State, call: Any) -> bool:
+    if any(
+        _parameter_dependency(value, state.parameter)
+        for capture in getattr(call, "capture_bindings", ())
+        for value in capture.get("sources", ())
+    ):
+        return True
+    # Older flow-0.2 snapshots can identify a lexical callee but omit captures.
+    # This fallback records a limit, never supplies a missing propagation edge.
+    return any(_lexical_capture(context, state, target) for target in (
+        *((identity_from_target(call.target),) if call.target else ()),
+        *candidate_identities(call),
+    ))
+
+
+def _deferred_capture_boundaries(
+    context: AnalysisContext, analysis: Any, state: _State
+) -> Iterable[AnalysisBoundary]:
+    identity = state.function.identity
+    for summary in analysis.functions:
+        if identity_from_target(summary["function"]) != identity:
+            continue
+        for value in summary.get("returns", ()):
+            if value.get("kind") not in {"callable", "function"}:
+                continue
+            target = FunctionIdentity(value.get("module", identity.module), value.get("source", ""))
+            if not _lexical_capture(context, state, target):
+                continue
+            span = None
+            for evidence in reversed(value.get("evidence", ())):
+                if evidence.get("file_path") and evidence.get("lineno"):
+                    span = SourceSpan(
+                        Path(evidence["file_path"]), evidence["lineno"],
+                        evidence.get("col_offset", 0),
+                        evidence.get("end_lineno", evidence["lineno"]),
+                        evidence.get("end_col_offset", 0),
+                    )
+                    break
+            yield AnalysisBoundary(
+                "deferred_callable_not_followed",
+                "A returned local callable lexically captures this carrier; "
+                "deferred execution is not followed.",
+                identity, span,
+            )
 
 
 def _receiver_contexts(analysis: Any, identity: FunctionIdentity) -> tuple:
@@ -1183,7 +1301,7 @@ def _callee_body_boundaries(analysis: Any, call: Any) -> tuple[AnalysisBoundary,
 
 
 def _analysis_boundaries(
-    analysis: Any, identity: FunctionIdentity, relevant_calls: set
+    analysis: Any, identity: FunctionIdentity, relevant_calls: set, parameter: str
 ) -> Iterable[AnalysisBoundary]:
     calls = {call.id: call for call in direct_calls(analysis, identity)}
     for boundary in analysis.boundaries:
@@ -1199,12 +1317,22 @@ def _analysis_boundaries(
             if identity_from_target(analysis.entry) != identity:
                 continue
         call_id = boundary.get("call_id")
+        affected = boundary.get("affected_values", ())
+        if boundary.get("affected_scope") == "known" and affected and not any(
+            _parameter_dependency(value, parameter) for value in affected
+        ):
+            continue
         if call_id and call_id not in relevant_calls:
             if call_id not in calls or reason not in {
                 "unsupported_expression",
                 "receiver_unresolved",
                 "definition_unavailable",
             }:
+                continue
+            # Preserve general target diagnostics when scope is unknown, but
+            # do not attach another channel's known call dependency to this one.
+            call = calls[call_id]
+            if not _call_depends_on_parameter(call, parameter):
                 continue
         yield AnalysisBoundary(
             "pcresolve_" + reason,

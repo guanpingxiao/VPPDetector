@@ -83,6 +83,7 @@ JSON.
 | `variadic_functions` | Variadic entries with their parameter names and `VariadicKind` channels. |
 | `findings` | Root API, variadic channel, downstream target, source locations and forwarding path. |
 | `boundaries` | Unresolved targets, unsupported effects and other analysis limits. |
+| `coverage` | One `VariadicCoverage` record per root variadic channel: observed status, finding count and boundary codes. |
 | `target_api` / `resolved_api` | Requested and resolved implementation identities for an on-demand scan; absent for a whole-package scan. |
 | `analyzer_schema_version` | PCResolve program-fact schema version. |
 
@@ -91,6 +92,21 @@ kind, callee expression, callsite, target, reason code and path.
 `ForwardingStep` records a source-resolved hop. Findings and steps retain
 `target_status`; findings can also retain target candidates and receiver-type
 evidence.
+
+Scan boundaries retain the implementation owner in `function` and, when a
+root channel is known, its `root_function`, `parameter_name` and
+`parameter_kind`. API scans use the requested identity for the root and the
+actual implementation for the diagnostic owner. Source-scope boundaries and
+assessment boundaries need not have a root channel.
+
+`VariadicCoverage.status` is `unavailable` when the root flow analysis fails,
+`limited` when relevant or source-scope boundaries are recorded, and
+`no_known_boundary` otherwise. The last status means no limitation was
+recorded by the supported analysis; it does not establish complete coverage
+or prove a negative. Findings can coexist with either of the other recorded
+limits. Each record also retains `finding_count`, unique `boundary_codes`
+and, for an API alias, its `implementation`. Missing API identities have no
+invented channels: `coverage` is empty and the entry boundary explains why.
 
 Enums serialize to lowercase strings, such as `var_keyword`; paths serialize
 to strings and tuples to arrays. See

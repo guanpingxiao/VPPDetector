@@ -72,6 +72,11 @@ class SourceIndex:
     classes: Tuple[FunctionIdentity, ...] = ()
     is_api_scope: bool = False
     _definition_index: object = field(default=None, init=False, repr=False)
+    _location_members: Optional[tuple] = field(default=None, init=False, repr=False, compare=False)
+    _function_locations: dict = field(default_factory=dict, init=False, repr=False, compare=False)
+    _constructor_locations: dict = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def find(self, identity: FunctionIdentity) -> Optional[IndexedFunction]:
         requested_path = identity.file_path.resolve() if identity.file_path else None
@@ -178,24 +183,39 @@ class SourceIndex:
         return self._definition_index
 
     def find_by_location(self, file_path: Path, lineno: int) -> Optional[IndexedFunction]:
+        """Look up an exact position within this fixed source snapshot."""
+
+        self._prepare_locations()
         resolved = file_path.resolve()
-        candidates = [
-            function
-            for function in self.functions
-            if function.identity.file_path
-            and function.identity.file_path.resolve() == resolved
-            and function.identity.lineno == lineno
-        ]
+        candidates = self._function_locations.get((resolved, lineno), ())
         if len(candidates) == 1:
             return candidates[0]
-        constructors = [
-            item.function
-            for item in self.constructors
-            if item.class_identity.file_path
-            and item.class_identity.file_path.resolve() == resolved
-            and item.class_identity.lineno == lineno
-        ]
+        constructors = self._constructor_locations.get((resolved, lineno), ())
         return constructors[0] if len(constructors) == 1 else None
+
+    def _prepare_locations(self) -> None:
+        members = self._location_members
+        if members is not None and members[0] is self.functions and members[1] is self.constructors:
+            return
+        paths, functions, constructors = {}, {}, {}
+
+        def position(identity: FunctionIdentity) -> tuple:
+            path = identity.file_path
+            if path not in paths:
+                paths[path] = path.resolve()
+            return paths[path], identity.lineno
+
+        for function in self.functions:
+            if function.identity.file_path:
+                functions.setdefault(position(function.identity), []).append(function)
+        for item in self.constructors:
+            if item.class_identity.file_path:
+                constructors.setdefault(position(item.class_identity), []).append(item.function)
+        # Keep candidate lists: duplicates must remain ambiguous, and function
+        # ambiguity retains the existing unique-constructor fallback.
+        self._function_locations = functions
+        self._constructor_locations = constructors
+        self._location_members = self.functions, self.constructors
 
 
 class _FunctionCollector(ast.NodeVisitor):
