@@ -46,6 +46,7 @@ _UNKNOWN = object()
 class _Value:
     literal: Any = _UNKNOWN
     tracked: bool = False
+    key_presence: bool = False
 
 
 @dataclass
@@ -61,12 +62,26 @@ class _Positionals:
     kind: str = "tuple"
 
 
+@dataclass(frozen=True)
+class _KeySet:
+    # Values mark which known key's presence belongs to the selected argument.
+    items: dict
+
+
 def _tracked(value: Any) -> bool:
     if isinstance(value, _Keywords):
         return any(_tracked(item) for item in value.items.values())
     if isinstance(value, _Positionals):
         return any(_tracked(item) for item in value.items)
+    if isinstance(value, _KeySet):
+        return any(value.items.values())
     return isinstance(value, _Value) and value.tracked
+
+
+def _key_presence(value: Any) -> bool:
+    if isinstance(value, _Value):
+        return value.key_presence
+    return isinstance(value, (_Keywords, _KeySet)) and _tracked(value)
 
 
 def _finite(node: ast.AST) -> _Value:
@@ -335,6 +350,7 @@ class _Frame:
     ancestry: tuple
     facts: dict
     returned: bool = False
+    rejection_guard: bool = False
 
     def unknown(self, reason, node):
         self.proof.unknown(
@@ -510,7 +526,53 @@ class _Frame:
                     f"{ast.unparse(statement.test)}: {truth}",
                     statement.test,
                 )
-                self.statements(statement.body if truth else statement.orelse)
+                previous = self.rejection_guard
+                # This narrow rejection concerns captured key acceptance, not
+                # arbitrary value constraints or errors in the other branch.
+                self.rejection_guard = previous or bool(truth and _key_presence(condition))
+                try:
+                    self.statements(statement.body if truth else statement.orelse)
+                finally:
+                    self.rejection_guard = previous
+            elif isinstance(statement, ast.Raise):
+                call = statement.exc
+                if (
+                    not self.rejection_guard
+                    or statement.cause is not None
+                    or not isinstance(call, ast.Call)
+                    or not isinstance(call.func, ast.Name)
+                    or call.keywords
+                    or not self.unshadowed_builtin_name(call.func.id)
+                ):
+                    self.unknown("unsupported_control_flow", statement)
+                exception = getattr(builtins, call.func.id, None)
+                edge = next(
+                    (
+                        edge
+                        for edge in direct_calls(self.analysis, self.function.identity)
+                        if (edge.lineno, edge.col_offset, edge.end_lineno, edge.end_col_offset)
+                        == (call.lineno, call.col_offset, call.end_lineno, call.end_col_offset)
+                    ),
+                    None,
+                )
+                if (
+                    not isinstance(exception, type)
+                    or not issubclass(exception, Exception)
+                    or edge is None
+                    or edge.target is not None
+                    or edge.target_status != "builtin_boundary"
+                ):
+                    self.unknown("exception_construction_unproven", statement)
+                # Even an established rejection guard must not execute a custom
+                # message formatter or turn an unrelated error into permission.
+                arguments = [self.expression(item) for item in call.args]
+                if any(
+                    not isinstance(item, _Value) or item.literal is _UNKNOWN for item in arguments
+                ):
+                    self.unknown("exception_construction_unproven", statement)
+                self.proof.reject(
+                    self.function, "proven_guard_rejection", ast.unparse(statement), statement
+                )
             elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 # A definition does not execute its body; captured calls are checked below.
                 if statement.decorator_list or any(
@@ -527,7 +589,7 @@ class _Frame:
 
     @staticmethod
     def truth(value):
-        if isinstance(value, (_Keywords, _Positionals)):
+        if isinstance(value, (_Keywords, _Positionals, _KeySet)):
             return bool(value.items)
         if isinstance(value, _Value) and value.literal is not _UNKNOWN:
             return bool(value.literal)
@@ -557,6 +619,33 @@ class _Frame:
             value = self.expression(node.value)
             if isinstance(value, _Positionals):
                 return self.positional_projection(value, node)
+        if isinstance(node, ast.JoinedStr):
+            pieces = []
+            tracked = False
+            for item in node.values:
+                if isinstance(item, ast.Constant) and type(item.value) is str:
+                    pieces.append(item.value)
+                    continue
+                if not isinstance(item, ast.FormattedValue) or item.format_spec is not None:
+                    self.unknown("unsupported_value_use", node)
+                value = self.expression(item.value)
+                if not isinstance(value, _Value) or value.literal is _UNKNOWN:
+                    self.unknown("unsupported_value_use", node)
+                if item.conversion not in (-1, 115, 114, 97):
+                    self.unknown("unsupported_value_use", node)
+                convert = {115: str, 114: repr, 97: ascii}.get(item.conversion, str)
+                pieces.append(convert(value.literal))
+                tracked = tracked or value.tracked
+            return _Value("".join(pieces), tracked)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub):
+            left, right = self.expression(node.left), self.expression(node.right)
+            if isinstance(left, _KeySet) and isinstance(right, _KeySet):
+                return _KeySet(
+                    {key: tracked for key, tracked in left.items.items() if key not in right.items}
+                )
+            if _tracked(left) or _tracked(right):
+                self.unknown("key_comparison_unproven", node)
+            return _Value()
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             left, right = self.expression(node.left), self.expression(node.right)
             if (
@@ -589,18 +678,22 @@ class _Frame:
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
             value = self.expression(node.operand)
             truth = self.truth(value)
-            return _Value(not truth if truth is not None else _UNKNOWN, _tracked(value))
+            return _Value(
+                not truth if truth is not None else _UNKNOWN, _tracked(value), _key_presence(value)
+            )
         if isinstance(node, ast.BoolOp):
             tracked = False
+            key_presence = False
             for item in node.values:
                 value = self.expression(item)
                 tracked = tracked or _tracked(value)
+                key_presence = key_presence or _key_presence(value)
                 truth = self.truth(value)
                 if truth is None:
                     return _Value(tracked=tracked)
                 if truth == isinstance(node.op, ast.Or):
                     return _Value(truth, tracked)
-            return _Value(truth, tracked)
+            return _Value(truth, tracked, key_presence and isinstance(node.op, ast.And) and truth)
         if isinstance(node, ast.Compare) and len(node.ops) == 1:
             left, right = self.expression(node.left), self.expression(node.comparators[0])
             tracked = _tracked(left) or (not isinstance(right, _Keywords) and _tracked(right))
@@ -612,7 +705,9 @@ class _Frame:
                     present = lval in right.items
                     tracked = tracked or _tracked(right.items.get(lval))
                     return _Value(
-                        present if isinstance(operation, ast.In) else not present, tracked
+                        present if isinstance(operation, ast.In) else not present,
+                        tracked,
+                        _tracked(right.items.get(lval)),
                     )
             if lval is not _UNKNOWN and rval is not _UNKNOWN:
                 if isinstance(operation, (ast.Is, ast.IsNot)) and (lval is None or rval is None):
@@ -719,6 +814,21 @@ class _Frame:
                     )
                 return _Value(tracked=tracked)
             if isinstance(receiver, _Keywords):
+                if node.func.attr == "copy" and facts:
+                    if (
+                        facts.target_status == "local_container_protocol"
+                        and not node.args
+                        and not node.keywords
+                        and any(
+                            effect.get("operation") == "copy"
+                            and effect.get("status") == "bounded"
+                            and effect.get("identity") == "shallow_copy"
+                            and effect.get("completion") == "normal_return"
+                            for effect in facts.effects
+                        )
+                    ):
+                        return _Keywords(dict(receiver.items), receiver.carrier)
+                    self.unknown("mapping_effect_unproven", node)
                 if (
                     node.func.attr == "pop"
                     and facts
@@ -775,14 +885,35 @@ class _Frame:
         if self.related(node.func):
             self.unknown("call_target_unproven", node)
         positional, keywords = self.arguments(node)
-        if any(
-            isinstance(item, _Keywords)
-            and item.carrier
-            or isinstance(item, _Positionals)
-            and _tracked(item)
-            for item in positional + list(keywords.values())
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in ("set", "list")
+            and facts
+            and facts.target is None
+            and facts.target_status == "python_protocol"
+            and self.unshadowed_builtin_name(node.func.id)
+            and len(positional) == 1
+            and not keywords
         ):
-            self.unknown("ordinary_container_argument", node)
+            value = positional[0]
+            if node.func.id == "set" and isinstance(value, _Keywords):
+                return _KeySet({key: _tracked(item) for key, item in value.items.items()})
+            if node.func.id == "set" and isinstance(value, _KeySet):
+                return _KeySet(dict(value.items))
+            if node.func.id == "list" and isinstance(value, _KeySet):
+                if len(value.items) > 1:
+                    self.unknown("key_iteration_order_unproven", node)
+                return _Positionals(
+                    tuple(_Value(key, tracked) for key, tracked in value.items.items()), kind="list"
+                )
+            self.unknown("key_comparison_unproven", node)
+        arguments = [({"position": position}, item) for position, item in enumerate(positional)]
+        arguments.extend(({"keyword": name}, item) for name, item in keywords.items())
+        ordinary = [
+            (argument, item)
+            for argument, item in arguments
+            if isinstance(item, (_Keywords, _Positionals, _KeySet)) and _tracked(item)
+        ]
         captured = facts and any(
             source.get("source") is not None
             and source.get("source")
@@ -791,7 +922,8 @@ class _Frame:
             for source in binding.get("sources", ())
         )
         if (
-            not any(_tracked(item) for item in positional + list(keywords.values()))
+            not ordinary
+            and not any(_tracked(item) for item in positional + list(keywords.values()))
             and not captured
         ):
             return _Value()
@@ -886,15 +1018,35 @@ class _Frame:
         target = self.proof.context.index.find(identity_from_target(facts.target))
         if target is None:
             self.unknown("call_target_unavailable", node)
+        if ordinary and (
+            facts.binding_status != "complete"
+            or facts.binding_issues
+            or any(
+                not any(
+                    binding.get("argument") == argument
+                    and binding.get("status") == "exact"
+                    and binding.get("destination_kind") == "parameter"
+                    for binding in facts.parameter_bindings
+                )
+                for argument, _ in ordinary
+            )
+        ):
+            self.unknown("ordinary_container_binding_unproven", node)
         values = self.proof.bind(
             target, positional, keywords, target.is_bound_method, node, caller=self.function
         )
         captured_keywords = values.get(target.signature.kwarg)
         captured_positionals = values.get(target.signature.vararg)
-        if _tracked(captured_keywords) or _tracked(captured_positionals):
+        if ordinary or _tracked(captured_keywords) or _tracked(captured_positionals):
             self.proof.note(
                 self.function,
-                "forwarded_positional" if _tracked(captured_positionals) else "forwarded_keyword",
+                "ordinary_container_forwarding"
+                if ordinary
+                else (
+                    "forwarded_positional"
+                    if _tracked(captured_positionals)
+                    else "forwarded_keyword"
+                ),
                 ast.unparse(node),
                 node,
                 target.identity,

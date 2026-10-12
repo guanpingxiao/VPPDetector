@@ -248,6 +248,12 @@ source-snapshot assumptions for static classmethod signature binding. It does
 not represent an observed runtime target; see
 [binding evidence](analysis-limits.md#supplied-call-facts).
 
+Evidence with reason `ordinary_container_forwarding` records a supported helper
+hop carrying the selected finite dictionary or sequence contents. It is not a
+rejection or acceptance by itself. `proven_guard_rejection` records an explicit
+exception on a supported captured-key rejection branch; it does not establish
+that a proposed parameter deletion makes the entire program run successfully.
+
 See [assessment states](analysis-limits.md#assessment-states) for the meaning
 of each result.
 

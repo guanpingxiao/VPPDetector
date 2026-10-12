@@ -121,7 +121,7 @@ call conditions and any recorded normal-path preconditions.
 | State | Meaning |
 | --- | --- |
 | `HANDLED` | The argument's value or presence is used, or its value binds to a downstream explicit parameter. |
-| `REJECTED` | Supported call conditions and recorded preconditions lead to a parameter-specific binding rejection. |
+| `REJECTED` | Supported conditions lead to a parameter-specific binding rejection or an explicit captured-key rejection. |
 | `IGNORED` | Supported executed paths do not use the argument's value or presence. |
 | `UNKNOWN` | Binding, control flow, dispatch or effects prevent a definite result. |
 
@@ -144,6 +144,24 @@ overwrite earlier values, while duplicate keys in a call's keyword expansions
 retain Python's binding rejection. Unknown mappings remain unresolved. Passing
 the resulting carrier as an ordinary dictionary parameter does not by itself
 prove that a downstream validator accepts its contents.
+
+Finite dictionaries and sequences can pass through ordinary helper parameters
+when the call target and exact parameter binding are supported by PCResolve.
+Assessment follows the helper body with the same selected contents and depth
+budget; merely accepting the container is not acceptance of its contents.
+Unresolved callable-instance candidates and dynamic override boundaries are
+not promoted to confirmed targets.
+
+For finite string-key dictionaries, assessment supports unshadowed built-in
+`set(mapping)`, key-set difference and singleton `list(keys)` projection.
+The selected key is tracked separately from other keys. An established
+key-presence rejection branch can report `proven_guard_rejection` for a built-in
+exception constructed from finite primitive arguments or a simple finite
+formatted message. Unknown keys, ambiguous set iteration order, shadowed
+protocols, exception recovery and arbitrary value-constraint failures remain
+unresolved. Disjunctions and rejection in the opposite branch are outside this
+narrow proof. A shallow dictionary copy requires a matching bounded PCResolve
+copy fact; other mutations still require their own effect evidence.
 
 For a single decorated entry/body, an exact PCResolve `decorator_effects` fact
 can permit analysis of the original body when both identity and body/binding
@@ -170,7 +188,7 @@ slices, same-kind concatenation and expansion. Rejection requires the selected
 value to reach a slot beyond a callee's positional capacity or another supported
 parameter-specific binding conflict. An error caused only by another supplied
 element does not license rejecting the selected one. Unknown-length expansions,
-sequence unpacking, ordinary-container helper calls and unsupported mutations
+sequence unpacking, unproven ordinary-container calls and unsupported mutations
 remain boundaries rather than assumptions about argument acceptance.
 
 ### Normal-path preconditions
