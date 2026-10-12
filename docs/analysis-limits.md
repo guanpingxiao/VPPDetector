@@ -139,6 +139,27 @@ Supported cases include direct/alias forwarding, finite expansions, bounded
 `pop` effects, simple literal/default-value guards and source-resolved
 downstream binding.
 
+Finite string-key dictionary displays can merge known mappings. Later keys
+overwrite earlier values, while duplicate keys in a call's keyword expansions
+retain Python's binding rejection. Unknown mappings remain unresolved. Passing
+the resulting carrier as an ordinary dictionary parameter does not by itself
+prove that a downstream validator accepts its contents.
+
+For a single decorated entry/body, an exact PCResolve `decorator_effects` fact
+can permit analysis of the original body when both identity and body/binding
+are preserved. The fact must match the source definition, decoration span and
+source hashes, with no unresolved or conflicting effects. Its normal-completion
+scope and source assumptions are recorded as `source_decorator_binding`
+evidence. Identity alone, missing facts, code/default changes and unsupported
+decorator composition remain unresolved; independent call boundaries still apply.
+
+A closed proof may include source-helper calls, documentation-cache construction,
+conditional `setdefault` effects and mapping lookups alongside `__doc__` writes.
+These records support the overall preservation proof; they do not independently
+prove that a helper or cache is harmless. Partial records in an unresolved proof
+do not permit body analysis, and input-function writes other than `__doc__`
+remain unsupported.
+
 Finite guards support `isinstance()` against unshadowed built-in `str`, `bytes`,
 `int`, `float`, `bool` and `object` types, and `startswith()` / `endswith()` on
 known strings with one known string argument. Unknown values, shadowed built-ins

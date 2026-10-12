@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import ast
 import builtins
+import hashlib
 import inspect
 import tokenize
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
 from .core import (
@@ -225,6 +227,82 @@ class _Proof:
         self.note(function, reason, detail, node, target or function.identity)
         raise _Stop(ParameterState.REJECTED, reason)
 
+    def decoration_preserved(self, function, analysis):
+        """Consume one exact body/binding proof, not callable identity alone."""
+
+        summaries = [
+            item
+            for item in analysis.functions
+            if identity_from_target(item["function"]) == function.identity
+        ]
+        if len(function.node.decorator_list) != 1 or len(summaries) != 1:
+            return False
+        effects = summaries[0].get("decorator_effects", ())
+        if len(effects) != 1:
+            return False
+        fact = effects[0]
+        expression = fact.get("expression", {})
+        decorator = function.node.decorator_list[0]
+        if (
+            identity_from_target(fact.get("function", {})) != function.identity
+            or Path(expression.get("file_path", "")) != function.identity.file_path
+            or any(
+                expression.get(name) != getattr(decorator, name)
+                for name in ("lineno", "col_offset", "end_lineno", "end_col_offset")
+            )
+            or fact.get("identity_status") != "preserved"
+            or fact.get("body_binding_status") != "preserved"
+            or fact.get("basis") != "source_snapshot"
+            or fact.get("completion") != "normal_return"
+            or fact.get("runtime_target_confirmed") is not False
+            or fact.get("boundaries")
+            or not fact.get("assumptions")
+            or not fact.get("evidence")
+            or not fact.get("target")
+        ):
+            return False
+        # Supporting records are admitted only within the closed proof above.
+        # They do not independently establish that a helper or cache is harmless.
+        for effect in fact.get("effects", ()):
+            kind = (effect.get("operation"), effect.get("impact"))
+            target = effect.get("target")
+            if target == "input_function":
+                if kind != ("attribute_write", "documentation"):
+                    return False
+                if effect.get("element_path") != ["__doc__"]:
+                    return False
+            elif isinstance(target, dict):
+                if kind != ("helper_call", "analyzed_source"):
+                    return False
+            elif target == "documentation_cache":
+                if kind not in (
+                    ("construction", "data_only"),
+                    ("setdefault", "data_only"),
+                    ("mapping_lookup", "data_protocol"),
+                ):
+                    return False
+            else:
+                return False
+        hashes = fact.get("source_hashes", {})
+        if str(function.identity.file_path) not in hashes:
+            return False
+        try:
+            if any(
+                hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest
+                for path, digest in hashes.items()
+            ):
+                return False
+        except OSError:
+            return False
+        self.note(
+            function,
+            "source_decorator_binding",
+            "Original body/binding preserved on normal decoration completion; "
+            + "; ".join(fact["assumptions"]),
+            decorator,
+        )
+        return True
+
     def run(self, function, values, *, analysis=None, ancestry=(), facts=()):
         if function.identity in ancestry:
             self.unknown(function, "recursive_forwarding", "Recursive variadic forwarding.")
@@ -236,12 +314,12 @@ class _Proof:
             self.unknown(
                 function, "deferred_execution", "Async/generator execution is not modeled."
             )
-        if function.node.decorator_list:
-            self.unknown(function, "decorated_entry", "Entry/body decoration is not modeled.")
         try:
             analysis = analysis or self.context.adapter.analyze(function.identity)
         except ResolutionError as exc:
             self.unknown(function, "flow_analysis_failed", str(exc))
+        if function.node.decorator_list and not self.decoration_preserved(function, analysis):
+            self.unknown(function, "decorated_entry", "Entry/body decoration is not proven.")
         frame = _Frame(
             self, function, analysis, values, ancestry + (function.identity,), dict(facts)
         )
@@ -491,11 +569,21 @@ class _Frame:
                 )
         if isinstance(node, ast.Dict):
             items = {}
+            carrier = False
             for key, value in zip(node.keys, node.values):
-                if key is None or not isinstance(key, ast.Constant) or type(key.value) is not str:
+                if key is None:
+                    mapping = self.expression(value)
+                    if not isinstance(mapping, _Keywords):
+                        self.unknown("dynamic_argument_expansion", node)
+                    # Dictionary displays overwrite earlier keys; unlike call
+                    # keyword expansions, duplicate keys do not raise here.
+                    items.update(mapping.items)
+                    carrier = carrier or mapping.carrier
+                    continue
+                if not isinstance(key, ast.Constant) or type(key.value) is not str:
                     self.unknown("dynamic_argument_expansion", node)
                 items[key.value] = self.expression(value)
-            return _Keywords(items)
+            return _Keywords(items, carrier)
         if isinstance(node, ast.Call):
             return self.call(node)
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
