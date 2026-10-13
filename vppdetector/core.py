@@ -1318,22 +1318,32 @@ def _analysis_boundaries(
                 continue
         call_id = boundary.get("call_id")
         affected = boundary.get("affected_values", ())
+        if boundary.get("affected_scope") == "none":
+            continue
         if boundary.get("affected_scope") == "known" and affected and not any(
             _parameter_dependency(value, parameter) for value in affected
         ):
             continue
         if call_id and call_id not in relevant_calls:
-            if call_id not in calls or reason not in {
-                "unsupported_expression",
-                "receiver_unresolved",
-                "definition_unavailable",
-            }:
+            call = calls.get(call_id)
+            if call is None:
                 continue
-            # Preserve general target diagnostics when scope is unknown, but
-            # do not attach another channel's known call dependency to this one.
-            call = calls[call_id]
-            if not _call_depends_on_parameter(call, parameter):
-                continue
+            protocol = getattr(call, "implicit_protocol", {})
+            implicit_exit = (
+                protocol.get("kind") == "context_manager_exit"
+                and protocol.get("method") == "__exit__"
+                and reason.startswith("context_exit_")
+            )
+            # Exit effects can affect the pending frame without receiving its
+            # carrier as an argument. Their affected roots, not forwarding-call
+            # membership, determine whether coverage is limited for this channel.
+            if not implicit_exit:
+                if reason not in {
+                    "unsupported_expression",
+                    "receiver_unresolved",
+                    "definition_unavailable",
+                } or not _call_depends_on_parameter(call, parameter):
+                    continue
         yield AnalysisBoundary(
             "pcresolve_" + reason,
             "PCResolve boundary: {}.".format(reason),
