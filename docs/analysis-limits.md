@@ -225,6 +225,17 @@ or remaining dispatch uncertainty. The assessment records those assumptions as
 Visible rebinding, incomplete mutation analysis and conflicting contexts remain
 unresolved. This does not authorize bypassing decorated helper bodies.
 
+A directly constructed module-level callable can be assessed when PCResolve
+supplies a matching `source_bound` callable-instance binding and finite
+constructor state. The target, receiver, source definition, snapshot hashes,
+assumption boundaries and incoming contexts must agree. The assessment records
+`source_callable_instance_binding`; it does not confirm runtime dispatch.
+Custom construction/lookup, visible writes, escapes and incomplete state retain
+uncertainty. Known constructor attributes can select finite conditional
+expressions, but unproved writes or untracked helper effects on that state stop
+assessment. An exact ordinary dict binding can support a bounded copy before
+unproved prior uses; it does not generally enable ordinary-container mutation.
+
 The analyzer does not execute client argument expressions or load runtime
 object graphs. Context caches retain program facts, while each assessment
 uses its own call conditions.

@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import ast
 import builtins
+import copy
 import hashlib
 import inspect
+import json
+import textwrap
 import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,12 +50,14 @@ class _Value:
     literal: Any = _UNKNOWN
     tracked: bool = False
     key_presence: bool = False
+    source_state: bool = False
 
 
 @dataclass
 class _Keywords:
     items: dict
     carrier: bool = False
+    source_state: bool = False
 
 
 @dataclass(frozen=True)
@@ -60,12 +65,39 @@ class _Positionals:
     items: tuple
     carrier: bool = False
     kind: str = "tuple"
+    source_state: bool = False
 
 
 @dataclass(frozen=True)
 class _KeySet:
     # Values mark which known key's presence belongs to the selected argument.
     items: dict
+
+
+@dataclass(frozen=True)
+class _SourceInstance:
+    attributes: dict
+
+
+def _source_state(value):
+    if not isinstance(value, dict):
+        raise ValueError("Unproven receiver state")
+    kind = value.get("kind")
+    if kind == "literal" and type(value.get("value")) in (str, bytes, int, float, bool, type(None)):
+        return _Value(value["value"], source_state=True)
+    if (
+        kind == "mapping"
+        and isinstance(value.get("items"), dict)
+        and all(type(key) is str for key in value["items"])
+    ):
+        return _Keywords(
+            {key: _source_state(item) for key, item in value["items"].items()}, source_state=True
+        )
+    if kind in {"tuple", "list"} and isinstance(value.get("items"), list):
+        return _Positionals(
+            tuple(_source_state(item) for item in value["items"]), kind=kind, source_state=True
+        )
+    raise ValueError("Unproven receiver state")
 
 
 def _tracked(value: Any) -> bool:
@@ -76,6 +108,12 @@ def _tracked(value: Any) -> bool:
     if isinstance(value, _KeySet):
         return any(value.items.values())
     return isinstance(value, _Value) and value.tracked
+
+
+def _protected_state(value: Any) -> bool:
+    if isinstance(value, _SourceInstance):
+        return True
+    return bool(getattr(value, "source_state", False))
 
 
 def _key_presence(value: Any) -> bool:
@@ -480,6 +518,13 @@ class _Frame:
                 )
                 for target in targets:
                     if not isinstance(target, ast.Name):
+                        root = target
+                        while isinstance(root, (ast.Attribute, ast.Subscript)):
+                            root = root.value
+                        if isinstance(root, ast.Name) and _protected_state(
+                            self.values.get(root.id)
+                        ):
+                            self.unknown("callable_instance_state_write_unproven", statement)
                         if self.related(statement) or _tracked(result):
                             self.unknown("unsupported_assignment", statement)
                         path = ast.unparse(target)
@@ -604,12 +649,30 @@ class _Frame:
                 return _Value(self.facts[node.id], value.tracked)
             return value
         if isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name):
+                receiver = self.values.get(node.value.id)
+                if isinstance(receiver, _SourceInstance):
+                    if node.attr not in receiver.attributes:
+                        self.unknown("callable_instance_state_unproven", node)
+                    return receiver.attributes[node.attr]
             path = ast.unparse(node)
             if path in self.facts:
                 return _Value(self.facts[path])
             if self.related(node):
                 self.unknown("unsupported_attribute_use", node)
             return _Value()
+        if isinstance(node, ast.IfExp):
+            condition = self.expression(node.test)
+            truth = self.truth(condition)
+            if truth is None:
+                self.unknown("unresolved_condition", node.test)
+            self.proof.note(
+                self.function,
+                "selected_expression_branch",
+                f"{ast.unparse(node.test)}: {truth}",
+                node.test,
+            )
+            return self.expression(node.body if truth else node.orelse)
         if isinstance(node, (ast.Tuple, ast.List)):
             return _Positionals(
                 tuple(self.positional_items(node.elts)),
@@ -926,6 +989,8 @@ class _Frame:
             and not any(_tracked(item) for item in positional + list(keywords.values()))
             and not captured
         ):
+            if any(_protected_state(item) for item in positional + list(keywords.values())):
+                self.unknown("callable_instance_state_effects_unproven", node)
             return _Value()
         if not facts or not facts.target or captured:
             self.unknown("call_target_unproven", node)
@@ -952,6 +1017,19 @@ class _Frame:
         }
         dynamic = {reason for reason in reasons if reason and reason.startswith("dynamic_")}
         dynamic.discard("dynamic_argument_expansion")
+        instance = None
+        instance_binding = getattr(facts, "callable_instance_evidence", {}).get("binding", {})
+        if status == "callable_instance_candidate":
+            instance = self.source_callable_binding(facts, instance_binding)
+            if instance is not None:
+                dynamic.discard("dynamic_callable_instance_override_possible")
+                self.proof.note(
+                    self.function,
+                    "source_callable_instance_binding",
+                    "; ".join(instance_binding["assumptions"]),
+                    node,
+                    identity_from_target(facts.target),
+                )
         source_binding = False
         bindings = getattr(facts, "class_method_bindings", ())
         if status == "classmethod" and len(bindings) == 1:
@@ -999,7 +1077,10 @@ class _Frame:
             # A method observation resolves this target only, not decorator
             # effects, metaclass construction, binding or later body behavior.
             dynamic.discard("dynamic_class_receiver_override_possible")
-        if status not in {"resolved", "constructor", "staticmethod", "classmethod"} or dynamic:
+        if (
+            status not in {"resolved", "constructor", "staticmethod", "classmethod"}
+            and instance is None
+        ) or dynamic:
             reason = sorted(dynamic)[0] if dynamic else "call_target_unproven"
             self.unknown(reason, node)
         if status == "classmethod" and confirmed is None and not source_binding:
@@ -1035,6 +1116,8 @@ class _Frame:
         values = self.proof.bind(
             target, positional, keywords, target.is_bound_method, node, caller=self.function
         )
+        if instance is not None:
+            values[instance_binding["implicit_binding"]["parameter"]] = instance
         captured_keywords = values.get(target.signature.kwarg)
         captured_positionals = values.get(target.signature.vararg)
         if ordinary or _tracked(captured_keywords) or _tracked(captured_positionals):
@@ -1065,6 +1148,83 @@ class _Frame:
                 target.identity,
             )
         return _Value()
+
+    def source_callable_binding(self, call, binding):
+        if not binding or call.binding_status != "complete" or call.binding_issues:
+            return None
+        target = identity_from_target(call.target)
+        definition = self.proof.context.index.find(target)
+        if definition is None or not definition.node.args.posonlyargs + definition.node.args.args:
+            return None
+        try:
+            witnessed = ast.parse(
+                textwrap.dedent(binding.get("definition", {}).get("source_text", ""))
+            )
+            if len(witnessed.body) != 1 or ast.dump(witnessed.body[0]) != ast.dump(definition.node):
+                return None
+        except (SyntaxError, ValueError, TypeError):
+            return None
+        evidence = call.callable_instance_evidence
+        boundaries = [
+            b
+            for b in self.analysis.boundaries
+            if b.get("call_id") == call.id
+            and b.get("reason") == "dynamic_callable_instance_override_possible"
+        ]
+        if not (
+            binding.get("status") == "source_bound"
+            and binding.get("basis") == "source_snapshot"
+            and binding.get("runtime_target_confirmed") is False
+            and not binding.get("issues")
+            and binding.get("target")
+            and identity_from_target(binding["target"]) == target
+            and binding.get("instance_type") == evidence.get("instance_type")
+            and binding.get("implicit_binding", {}).get("status") == "static_bound"
+            and binding.get("implicit_binding", {}).get("parameter")
+            == (definition.node.args.posonlyargs + definition.node.args.args)[0].arg
+            and binding.get("assumptions")
+            and binding.get("evidence")
+            and len(call.target_candidates) == 1
+            and identity_from_target(call.target_candidates[0]) == target
+            and boundaries
+            and all(
+                b.get("boundary_kind") == "assumption" and b.get("binding_status") == "source_bound"
+                for b in boundaries
+            )
+            and all(
+                incoming.get("target") == binding["target"]
+                and incoming.get("callable_instance_evidence") == evidence
+                for incoming in getattr(call, "analysis_contexts", ())
+            )
+            and binding.get("snapshot_sha256")
+            == hashlib.sha256(
+                json.dumps(self.analysis.inputs["sha256"], sort_keys=True).encode("utf-8")
+            ).hexdigest()
+        ):
+            return None
+        hashes = binding.get("source_hashes", {})
+        if not hashes or binding.get("source_hash_policy") != "utf-8-sig-universal-newlines":
+            return None
+        try:
+            if any(
+                self.analysis.inputs["sha256"].get(path) != digest
+                or hashlib.sha256(
+                    Path(path).read_text(encoding="utf-8-sig").encode("utf-8")
+                ).hexdigest()
+                != digest
+                for path, digest in hashes.items()
+            ):
+                return None
+        except (OSError, UnicodeError):
+            return None
+        try:
+            state = {
+                name: _source_state(value)
+                for name, value in copy.deepcopy(binding.get("receiver_state", {})).items()
+            }
+        except (ValueError, TypeError, KeyError, RecursionError):
+            return None
+        return _SourceInstance(state)
 
     def instance_guard(self, node):
         value = self.expression(node.args[0])
