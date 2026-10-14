@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple
 
+from ._scan_facts import capture_names, conditions_possible, copy_protocol_target, immediate_body
 from .models import (
     AnalysisBoundary,
     ForwardingFinding,
@@ -87,6 +88,7 @@ class AnalysisContext:
     _scan_cache: dict = field(default_factory=dict, init=False, repr=False)
     _transform_spans: dict = field(default_factory=dict, init=False, repr=False)
     _return_transform_spans: dict = field(default_factory=dict, init=False, repr=False)
+    _constant_tests: dict = field(default_factory=dict, init=False, repr=False)
 
     @classmethod
     def from_source(cls, source: SourceContext) -> "AnalysisContext":
@@ -196,6 +198,7 @@ class _State:
     path: Tuple[ForwardingStep, ...] = ()
     ancestry: tuple = ()
     analysis: Any = field(default=None, compare=False, repr=False)
+    capture: bool = False
 
 
 def scan_function(
@@ -226,7 +229,10 @@ def scan_function(
                 AnalysisBoundary("flow_analysis_failed", str(exc), identity), entry, state
             ))
             continue
-        state_key = (identity, state.parameter, state.kind, _receiver_contexts(analysis, identity))
+        state_key = (
+            identity, state.parameter, state.kind, state.capture,
+            _receiver_contexts(analysis, identity),
+        )
         if state_key in state.ancestry:
             boundaries.append(
                 _root_boundary(
@@ -242,7 +248,8 @@ def scan_function(
         for call in direct_calls(analysis, identity):
             if _call_depends_on_parameter(call, state.parameter):
                 relevant_calls.add(call.id)
-            if _call_captures_parameter(context, state, call):
+            capture_flows = _capture_flows(context, analysis, state, call)
+            if _call_captures_parameter(context, state, call) and not capture_flows:
                 relevant_calls.add(call.id)
                 boundaries.append(AnalysisBoundary(
                     "closure_capture_not_followed",
@@ -257,12 +264,18 @@ def scan_function(
                     for value in item.get("sources", ())
                 )
             ]
+            inputs = (
+                [dict(flow, source_parameter=state.parameter) for flow in call.argument_flows
+                 if flow.get("kind") == "capture" and flow.get("source") == state.parameter]
+                if state.capture else call.parameter_flows
+            )
             flows = [
-                flow
-                for flow in call.parameter_flows
+                flow for flow in inputs
                 if flow.get("source_parameter") == state.parameter
                 and flow.get("argument") not in object_arguments
+                and conditions_possible(context, flow)
             ]
+            flows.extend(capture_flows)
             flows.extend(
                 _returned_flows(
                     context, analysis, state, call, max_depth - len(state.path) - 1, boundaries
@@ -276,6 +289,10 @@ def scan_function(
             uncertain_operation = _carrier_operation_boundary(
                 analysis, identity, state.parameter, call
             )
+            if state.capture and uncertain_operation is None:
+                uncertain_operation = next((operation for flow in carried for operation in (
+                    _return_operation_boundary(analysis, state.function, flow, call),
+                ) if operation is not None), None)
             if carried and uncertain_operation is not None:
                 boundaries.append(
                     AnalysisBoundary(
@@ -383,10 +400,11 @@ def scan_function(
                             else definition.signature.vararg
                         )
                     else:
-                        next_parameter = flow.get("target_parameter")
+                        next_parameter = flow.get("target_capture", flow.get("target_parameter"))
                         if flow.get("target_path"):
                             next_parameter = None
-                    if next_parameter not in _parameters(definition):
+                    captured = flow.get("target_capture") is not None
+                    if not captured and next_parameter not in _parameters(definition):
                         boundaries.append(
                             AnalysisBoundary(
                                 "propagation_binding_unavailable",
@@ -427,6 +445,7 @@ def scan_function(
                         path,
                         (*state.ancestry, state_key),
                         child,
+                        captured,
                     )
                     if next_state not in pending:
                         pending.append(next_state)
@@ -484,11 +503,7 @@ def _lexical_capture(
     definition = context.index.find(target)
     if definition is None:
         return False
-    from pcresolve.scope_facts import captured_names, function_scope_facts
-
-    return state.parameter in captured_names(
-        function_scope_facts(definition.node), (state.parameter,)
-    )
+    return state.parameter in capture_names(definition.node, (state.parameter,))
 
 
 def _call_captures_parameter(context: AnalysisContext, state: _State, call: Any) -> bool:
@@ -504,6 +519,59 @@ def _call_captures_parameter(context: AnalysisContext, state: _State, call: Any)
         *((identity_from_target(call.target),) if call.target else ()),
         *candidate_identities(call),
     ))
+
+
+def _capture_flows(context: AnalysisContext, analysis: Any, state: _State, call: Any) -> list:
+    """Use only exact call-time open captures of an immediately invoked local function."""
+
+    if (call.target is None or _target_status(analysis, call) != "resolved"
+            or call.analysis_status != "analyzed" or call.binding_status != "complete"
+            or call.binding_issues):
+        return []
+    target = identity_from_target(call.target)
+    definition = _target_definition(context, target)
+    if (definition is None or not immediate_body(definition.node)
+            or target.module != state.function.identity.module
+            or not target.qualname.startswith(state.function.identity.qualname + ".")
+            or any(candidate != target for candidate in candidate_identities(call))):
+        return []
+    records = getattr(call, "capture_bindings", ())
+    names = tuple(item.get("capture") for item in records)
+    lexical = capture_names(definition.node, names)
+    result = []
+    for record in records:
+        name = record.get("capture")
+        binding = record.get("container_binding", {})
+        roots = record.get("sources", ())
+        if (name not in lexical or names.count(name) != 1
+                or binding.get("status") != "exact" or binding.get("contents_unknown")
+                or binding.get("shape") not in {"dict", "list", "tuple"}
+                or not binding.get("evidence") or not conditions_possible(context, binding)
+                or len(roots) != 1 or roots[0].get("kind") != "container"
+                or roots[0].get("source") != binding.get("source")
+                or roots[0].get("container_shape") != binding.get("shape")
+                or roots[0].get("relation") != "direct"
+                or any(roots[0].get(flag) for flag in (
+                    "value_incomplete", "projection", "output_path",
+                ))):
+            continue
+        contents = record.get("current_sources", ())
+        if any(value.get("value_incomplete") or (value.get("object_only")
+                and not conditions_possible(context, value)) for value in contents):
+            continue
+        for value in contents:
+            if (not _parameter_dependency(value, state.parameter)
+                    or not _open_container(context, value)
+                    or not conditions_possible(context, value)):
+                continue
+            expected = "dict" if state.kind is VariadicKind.KEYWORD else {"list", "tuple"}
+            if (binding["shape"] != expected if isinstance(expected, str)
+                    else binding["shape"] not in expected):
+                continue
+            result.append(dict(value, source_parameter=state.parameter,
+                argument={"capture": name}, target_capture=name, target_parameter=None,
+                target_path=[], relation="direct", output_path=[]))
+    return result
 
 
 def _deferred_capture_boundaries(
@@ -573,7 +641,7 @@ def _expand_body(
             for argument in call.argument_sources
             for value in argument.get("sources", ())
         )
-        if not required and not incoming_callable:
+        if not required and not incoming_callable and not getattr(call, "capture_bindings", ()):
             # Instance-method source candidates and ordinary helpers retain
             # the existing nominal body analysis. Never use this fallback for
             # a missing class receiver context.
@@ -683,7 +751,7 @@ def _depends_on_parameter(values: Iterable[dict], parameter: str, calls: dict) -
     pending, seen = list(values), set()
     while pending:
         value = pending.pop()
-        if value.get("kind") == "parameter" and value.get("source") == parameter:
+        if value.get("kind") in {"parameter", "capture"} and value.get("source") == parameter:
             return True
         producer = calls.get(value.get("source"))
         if value.get("kind") == "call_result" and producer and producer.id not in seen:
@@ -691,6 +759,8 @@ def _depends_on_parameter(values: Iterable[dict], parameter: str, calls: dict) -
             pending.extend(
                 value for item in producer.argument_sources for value in item.get("sources", ())
             )
+            pending.extend(value for item in getattr(producer, "capture_bindings", ())
+                           for value in item.get("current_sources", ()))
     return False
 
 
@@ -784,15 +854,30 @@ def _returned_flows(
         resolve_return_dependencies,
     )
 
-    summaries, calls, producers = {}, {}, {}
+    summaries, calls, producers, protocols = {}, {}, {}, {}
 
     def boundary(code, message, call):
         boundaries.append(
             AnalysisBoundary(code, message, identity_from_target(call.caller), call_span(call))
         )
 
-    def safe_values(values, owner, owner_analysis, endpoint, remaining):
+    def safe_values(values, owner, owner_analysis, endpoint, remaining, captured=()):
         values = list(values)
+        # Materialized contents need not repeat the object's branch conditions.
+        # Dropping an impossible endpoint alone could leave its stale inputs
+        # looking like an independent open container after a control-flow join.
+        if any(
+            (value.get("object_only") or value.get("container_object"))
+            and not conditions_possible(context, value) for value in values
+        ):
+            boundaries.append(AnalysisBoundary(
+                "return_object_unproven",
+                "Current contents cannot be separated from an impossible object context.",
+                owner.identity,
+                call_span(endpoint) if endpoint is not owner.node else None,
+            ))
+            return []
+        values = [value for value in values if conditions_possible(context, value)]
         endpoints = [
             value for value in values if value.get("object_only") or value.get("container_object")
         ]
@@ -838,7 +923,7 @@ def _returned_flows(
                         evidence.get("end_lineno", evidence["lineno"]),
                         evidence.get("end_col_offset", 0),
                     )
-            operation = _return_operation_boundary(owner_analysis, owner.identity, value, read_at)
+            operation = _return_operation_boundary(owner_analysis, owner, value, read_at)
             if operation is not None:
                 boundaries.append(
                     AnalysisBoundary(
@@ -850,10 +935,17 @@ def _returned_flows(
                 )
                 continue
             result.append(value)
+        if state.capture and owner.identity == state.function.identity:
+            result = [dict(value, kind="parameter") if value.get("kind") == "capture"
+                      and value.get("source") == state.parameter else value for value in result]
         if endpoint is owner.node:
             # A capture's final wildcard denotes its elements, not an extra
             # nested container. The incoming binding supplies the open space.
             result = [_capture_return_value(value, owner) for value in result]
+            result = [dict(value, relation="direct", output_path=[])
+                      if value.get("kind") == "capture" and value.get("source") in captured
+                      and value.get("output_path") == ["*"] and not value.get("projection")
+                      else value for value in result]
         if object_path and result:
             # Adapt only current contents to the neutral dependency router.
             # The synthetic binding never reads the producer's old inputs;
@@ -953,6 +1045,13 @@ def _returned_flows(
                 for item in producer.argument_sources
                 if item.get("parameter") is not None
             )
+            captured = {flow["target_capture"] for flow in
+                        _capture_flows(context, owner_analysis, state, producer)}
+            bindings += tuple(
+                CallBinding("capture", item["capture"], tuple(safe_values(
+                    item.get("current_sources", ()), owner, owner_analysis, producer, remaining - 1,
+                ))) for item in producer.capture_bindings if item.get("capture") in captured
+            )
             returns = next(
                 (
                     item.get("returns", ())
@@ -961,7 +1060,9 @@ def _returned_flows(
                 ),
                 (),
             )
-            returns = safe_values(returns, definition, child, definition.node, remaining - 1)
+            returns = safe_values(
+                returns, definition, child, definition.node, remaining - 1, captured,
+            )
             summaries[definition.identity] = returns
             calls[producer.id] = ReturnCall(producer.id, definition.identity, bindings)
             producers[producer.id] = producer
@@ -991,13 +1092,14 @@ def _returned_flows(
             )
             return None
         obj = value.get("container_object", {})
-        if not _proven_object_alias(value) or (
+        protocol = copy_protocol_target(owner, owner_analysis, producer, value)
+        if protocol is None and (not _proven_object_alias(value) or (
             producer.analysis_status != "analyzed"
             or producer.binding_status != "complete"
             or not producer.target
             or _target_status(owner_analysis, producer) != "resolved"
             or identity_from_target(obj["function"]) != identity_from_target(producer.target)
-        ):
+        )):
             boundary("return_object_unproven", "Returned object identity is incomplete.", producer)
             return None
         if producer.id in stack:
@@ -1013,17 +1115,27 @@ def _returned_flows(
             boundaries.extend(body_boundaries)
             return None
         producers[producer.id] = producer
-        incoming = [
-            source
-            for item in producer.argument_sources
-            if item.get("parameter") == obj["parameter"]
-            for source in item.get("sources", ())
-            if source.get("object_only")
-        ]
+        if protocol is not None:
+            protocols[producer.id] = protocol
+            incoming = [source for source in (
+                *producer.receiver_sources,
+                *(source for item in producer.argument_sources
+                  for source in item.get("sources", ())),
+            ) if source.get("object_only")]
+            input_object = obj["copied_from"]
+        else:
+            incoming = [
+                source
+                for item in producer.argument_sources
+                if item.get("parameter") == obj["parameter"]
+                for source in item.get("sources", ())
+                if source.get("object_only")
+            ]
+            input_object = obj["source"]
         if not incoming:
             return (producer.id,)
         if len(incoming) != 1 or (
-            incoming[0].get("container_object", {}).get("source") != obj["source"]
+            incoming[0].get("container_object", {}).get("source") != input_object
         ):
             boundary(
                 "return_object_unproven", "Returned object contexts are conflicting.", producer
@@ -1050,6 +1162,8 @@ def _returned_flows(
         if resolution.status != "converged":
             boundary("return_flow_limit_reached", "Return dependency budget reached.", destination)
         for flow in resolution.paths:
+            if not conditions_possible(context, flow):
+                continue
             steps = []
             for call_id in flow.get("call_context", ()):
                 producer = producers[call_id]
@@ -1072,7 +1186,8 @@ def _returned_flows(
                         parameter,
                         producer.callee_name,
                         call_span(producer),
-                        identity_from_target(producer.target),
+                        protocols.get(producer.id) or identity_from_target(producer.target),
+                        "local_container_protocol" if producer.id in protocols else "resolved",
                     )
                 )
             result.append(
@@ -1134,7 +1249,7 @@ def _capture_return_value(value: dict, function: IndexedFunction) -> dict:
 
 
 def _return_operation_boundary(
-    analysis: Any, identity: FunctionIdentity, value: dict, destination: Any
+    analysis: Any, owner: IndexedFunction, value: dict, destination: Any
 ) -> Optional[SourceSpan]:
     """Unknown effects on a returned alias must not restore open contents.
 
@@ -1147,7 +1262,7 @@ def _return_operation_boundary(
         destination.end_lineno or destination.lineno,
         destination.end_col_offset or destination.col_offset,
     )
-    for call in direct_calls(analysis, identity):
+    for call in direct_calls(analysis, owner.identity):
         if call.id == getattr(destination, "id", None):
             continue
         if (call.lineno, call.col_offset) > endpoint:
@@ -1157,6 +1272,10 @@ def _return_operation_boundary(
         if call.result_sources and all(
             _proven_object_alias(source) for source in call.result_sources
         ):
+            continue
+        if len(call.result_sources) == 1 and copy_protocol_target(
+            owner, analysis, call, call.result_sources[0]
+        ) is not None:
             continue
         if _modeled_mapping_removal(analysis, call):
             # Only remove the unknown-effect barrier. Current content facts,

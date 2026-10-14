@@ -177,7 +177,7 @@ class VariadicFunction:
 
 @dataclass(frozen=True)
 class ForwardingStep:
-    """One source-resolved hop in a root API's forwarding path."""
+    """One source or proven builtin-protocol hop in an API's forwarding path."""
 
     function: FunctionIdentity
     parameter_name: str

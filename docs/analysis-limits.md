@@ -46,6 +46,11 @@ Supported analysis includes:
   exact call edges.
 - Proven returned-object aliases and complete finite constant-key removal
   facts that preserve an open remainder.
+- Bounded builtin dict copies and dict/list/tuple conversions, when PCResolve
+  supplies matching copy effects, object identity and current contents.
+- Immediately invoked synchronous source closures with exact call-time captured
+  container shapes and current open contents; nested named scopes can relay
+  the same capture within the forwarding depth limit.
 
 Passing a container as an ordinary argument is a propagation hop, not a
 finding by itself. A finding requires an eventual expansion into a signature
@@ -59,6 +64,14 @@ current contents rather than old input dependencies. Removing modeled finite
 keys retains the open remainder; clearing an alias does not restore its
 original contents. Object identity alone is insufficient to establish
 variadic propagation.
+
+Copy proofs are checked against the producing call, its indexed source witness,
+the exact input/output objects and normal-completion effects. The scanner reads
+current contents at the expansion; it does not restore a cleared copy from old
+input dependencies. Copies can retain an independent open remainder after the
+original is cleared. Paths record builtin copy/conversion steps under `builtins`
+with `target_status="local_container_protocol"`; each step counts toward depth.
+Missing, conflicting or effect-uncertain facts remain boundaries.
 
 Complete ordinary-parameter constant-key removal facts can preserve propagation
 through an existing alias. Normal-return effects describe that return path,
@@ -88,7 +101,12 @@ when the required shape facts are unavailable.
 
 Carrier receiver operations preserve PCResolve's specific effect diagnostics
 even when no ordinary argument flow was produced. Locally resolved callables
-with captured channel dependencies report `closure_capture_not_followed`;
+with captured channel dependencies report `closure_capture_not_followed` when
+their current capture facts, synchronous execution or unique call context
+cannot be established. Proven immediate captures are followed using isolated
+edge expansion, retaining call-time rebinding and modeled mutations. Generator
+and async callable bodies are not inferred to execute merely from a call.
+Unmodeled writes or effects retain boundaries;
 returned local callables with lexical captures report
 `deferred_callable_not_followed`. These diagnostics describe unmodeled
 propagation, not newly established forwarding paths. Lexical capture does
@@ -98,6 +116,15 @@ outside the immediate scan path. Shadowed local parameters are not captures.
 Unresolved targets, unsupported propagation, recursion and depth limits also
 remain visible diagnostics. The default depth limit is five hops;
 source-resolved return-producing calls count toward the limit.
+
+Recorded flow conditions contradicted by matching constant source syntax are
+excluded from findings, including literal truth values, `not` and decisive
+`and`/`or` expressions. Other conditions remain potential paths. This does not
+solve general path feasibility, infer caller values or change a structural
+finding into a parameter-level compatibility decision.
+If joined contents cannot be separated from an impossible object context,
+the scanner retains `return_object_unproven` rather than treating the object's
+materialized input dependencies as independent propagation.
 
 ## Source-scope boundaries
 

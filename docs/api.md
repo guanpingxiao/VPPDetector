@@ -89,9 +89,14 @@ JSON.
 
 Each `ForwardingFinding` retains the root function, variadic parameter name and
 kind, callee expression, callsite, target, reason code and path.
-`ForwardingStep` records a source-resolved hop. Findings and steps retain
+`ForwardingStep` records a source or proven builtin-protocol hop. Findings and steps retain
 `target_status`; findings can also retain target candidates and receiver-type
 evidence.
+
+Paths may include source-proven builtin copy/conversion steps. These steps use
+the `builtins` module, omit unavailable source locations and retain
+`target_status="local_container_protocol"`. Each copy/conversion consumes one
+forwarding hop, including copies composed with source-return and closure paths.
 
 Scan boundaries retain the implementation owner in `function` and, when a
 root channel is known, its `root_function`, `parameter_name` and
