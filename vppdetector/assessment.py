@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
+from ._scan_facts import copy_protocol_target
 from .core import (
     AnalysisContext,
     ResolutionError,
@@ -332,6 +333,32 @@ class _Proof:
                     ("construction", "data_only"),
                     ("setdefault", "data_only"),
                     ("mapping_lookup", "data_protocol"),
+                ):
+                    return False
+            elif target == "decorator_instance":
+                construction = fact.get("construction") or {}
+                path = effect.get("element_path", ())
+                scalar_shapes = {"str", "int", "bool", "float", "NoneType"}
+                if (
+                    kind != ("attribute_write", "data_only")
+                    or construction.get("lifetime") != "single_decoration"
+                    or len(path) != 1
+                    or not path[0].isidentifier()
+                    or path[0].startswith("__")
+                    or not effect.get("before_shapes")
+                    or not set(effect["before_shapes"]) <= scalar_shapes
+                    or not effect.get("after_shapes")
+                    or not set(effect["after_shapes"]) <= scalar_shapes
+                    or effect.get("conditions")
+                ):
+                    return False
+            elif target == "str.join":
+                if (
+                    kind != ("builtin_call", "data_only")
+                    or effect.get("receiver_shape") != "str"
+                    or effect.get("sequence_shape") not in ("list", "tuple")
+                    or "element_shapes" not in effect
+                    or any(shape != ["str"] for shape in effect["element_shapes"])
                 ):
                     return False
             else:
@@ -948,6 +975,25 @@ class _Frame:
         if self.related(node.func):
             self.unknown("call_target_unproven", node)
         positional, keywords = self.arguments(node)
+        if facts and len(facts.result_sources) == 1:
+            protocol = copy_protocol_target(
+                self.function, self.analysis, facts, facts.result_sources[0]
+            )
+            if protocol is not None and isinstance(node.func, ast.Name):
+                value = positional[0]
+                copied = None
+                if protocol.qualname == "dict" and isinstance(value, _Keywords):
+                    copied = _Keywords(dict(value.items), value.carrier, value.source_state)
+                elif protocol.qualname in ("tuple", "list") and isinstance(value, _Positionals):
+                    copied = _Positionals(
+                        value.items, value.carrier, protocol.qualname, value.source_state
+                    )
+                if copied is not None:
+                    # Copy current modeled contents, retaining selected values and element order.
+                    self.proof.note(
+                        self.function, "builtin_container_copy", ast.unparse(node), node, protocol
+                    )
+                    return copied
         if (
             isinstance(node.func, ast.Name)
             and node.func.id in ("set", "list")

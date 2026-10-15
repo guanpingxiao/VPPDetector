@@ -193,6 +193,12 @@ budget; merely accepting the container is not acceptance of its contents.
 Unresolved callable-instance candidates and dynamic override boundaries are
 not promoted to confirmed targets.
 
+Assessment preserves selected contents through `dict(mapping)`, `tuple(sequence)`
+and `list(sequence)` when PCResolve proves the matching builtin copy protocol.
+Dictionary copies keep independent key removal; sequence copies retain element
+order and list/tuple kind. The source witness and copy effects must agree;
+custom containers, constructor rebinding and unknown mutation remain unresolved.
+
 For finite string-key dictionaries, assessment supports unshadowed built-in
 `set(mapping)`, key-set difference and singleton `list(keys)` projection.
 The selected key is tracked separately from other keys. An established
@@ -218,6 +224,13 @@ These records support the overall preservation proof; they do not independently
 prove that a helper or cache is harmless. Partial records in an unresolved proof
 do not permit body analysis, and input-function writes other than `__doc__`
 remain unsupported.
+
+A closed decoration proof can also include scalar field updates on a
+single-decoration instance and builtin `str.join` over a finite string list or
+tuple. Shared-instance state, conditional/unknown writes and custom iterable
+protocols are not admitted. These supporting data effects cannot override a
+remaining unresolved helper call, even when its arguments are documentation
+strings; no decorator or document-processing library name is a transparency rule.
 
 Finite guards support `isinstance()` against unshadowed built-in `str`, `bytes`,
 `int`, `float`, `bool` and `object` types, and `startswith()` / `endswith()` on
