@@ -20,12 +20,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
-from ._scan_facts import copy_protocol_target
+from ._scan_facts import capture_names, conditions_possible, copy_protocol_target, immediate_body
 from .core import (
     AnalysisContext,
     ResolutionError,
     _target_status,
     call_span,
+    candidate_identities,
     direct_calls,
     identity_from_target,
 )
@@ -78,6 +79,11 @@ class _KeySet:
 @dataclass(frozen=True)
 class _SourceInstance:
     attributes: dict
+
+
+@dataclass(frozen=True)
+class _LocalFunction:
+    node: ast.AST
 
 
 def _source_state(value):
@@ -388,9 +394,7 @@ class _Proof:
             self.unknown(function, "recursive_forwarding", "Recursive variadic forwarding.")
         if len(ancestry) >= self.max_depth:
             self.unknown(function, "depth_limit", "Argument propagation depth exhausted.")
-        if isinstance(function.node, ast.AsyncFunctionDef) or any(
-            isinstance(node, (ast.Yield, ast.YieldFrom)) for node in ast.walk(function.node)
-        ):
+        if not immediate_body(function.node):
             self.unknown(
                 function, "deferred_execution", "Async/generator execution is not modeled."
             )
@@ -404,6 +408,7 @@ class _Proof:
             self, function, analysis, values, ancestry + (function.identity,), dict(facts)
         )
         frame.statements(function.node.body)
+        return frame.result
 
 
 @dataclass
@@ -416,6 +421,7 @@ class _Frame:
     facts: dict
     returned: bool = False
     rejection_guard: bool = False
+    result: Any = field(default_factory=_Value)
 
     def unknown(self, reason, node):
         self.proof.unknown(
@@ -533,6 +539,7 @@ class _Frame:
                 break
             if isinstance(statement, ast.Return):
                 result = self.expression(statement.value) if statement.value else _Value(None)
+                self.result = result
                 if _tracked(result):
                     self.proof.handled(
                         self.function, "consumed_value", "Value participates in return.", statement
@@ -559,6 +566,8 @@ class _Frame:
                             if name == path or name.startswith(path + "."):
                                 del self.facts[name]
                         continue
+                    if isinstance(self.values.get(target.id), _LocalFunction):
+                        self.unknown("local_callable_rebinding", statement)
                     self.values[target.id] = result
                     # A reassignment invalidates trusted receiver/parameter facts too.
                     for name in tuple(self.facts):
@@ -649,11 +658,17 @@ class _Frame:
                 # A definition does not execute its body; captured calls are checked below.
                 if statement.decorator_list or any(
                     self.related(item)
+                    or isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and any(isinstance(child, ast.Call) for child in ast.walk(item))
                     for item in ast.iter_child_nodes(statement)
                     if not isinstance(item, ast.stmt)
                 ):
                     self.unknown("definition_effects_unmodeled", statement)
-                self.values[statement.name] = _Value(tracked=self.related(statement))
+                self.values[statement.name] = (
+                    _LocalFunction(statement)
+                    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    else _Value(tracked=self.related(statement))
+                )
             elif isinstance(statement, ast.Pass):
                 continue
             else:
@@ -672,6 +687,8 @@ class _Frame:
             return _finite(node)
         if isinstance(node, ast.Name):
             value = self.values.get(node.id, _Value())
+            if isinstance(value, _LocalFunction):
+                self.unknown("deferred_callable_not_followed", node)
             if node.id in self.facts and isinstance(value, _Value):
                 return _Value(self.facts[node.id], value.tracked)
             return value
@@ -1023,12 +1040,17 @@ class _Frame:
             for argument, item in arguments
             if isinstance(item, (_Keywords, _Positionals, _KeySet)) and _tracked(item)
         ]
-        captured = facts and any(
-            source.get("source") is not None
-            and source.get("source")
-            in {self.function.signature.kwarg, self.function.signature.vararg}
-            for binding in facts.capture_bindings
-            for source in binding.get("sources", ())
+        local = self.values.get(node.func.id) if isinstance(node.func, ast.Name) else None
+        captured = (
+            isinstance(local, _LocalFunction)
+            or facts
+            and any(
+                source.get("source") is not None
+                and source.get("source")
+                in {self.function.signature.kwarg, self.function.signature.vararg}
+                for binding in facts.capture_bindings
+                for source in binding.get("sources", ())
+            )
         )
         if (
             not ordinary
@@ -1038,7 +1060,7 @@ class _Frame:
             if any(_protected_state(item) for item in positional + list(keywords.values())):
                 self.unknown("callable_instance_state_effects_unproven", node)
             return _Value()
-        if not facts or not facts.target or captured:
+        if not facts or not facts.target or captured and not isinstance(local, _LocalFunction):
             self.unknown("call_target_unproven", node)
         status = _target_status(self.analysis, facts)
         confirmed = self.proof.known_targets.get(call_span(facts))
@@ -1145,6 +1167,7 @@ class _Frame:
         target = self.proof.context.index.find(identity_from_target(facts.target))
         if target is None:
             self.unknown("call_target_unavailable", node)
+        captures = self.capture_values(target, facts, local, node) if captured else {}
         if ordinary and (
             facts.binding_status != "complete"
             or facts.binding_issues
@@ -1162,14 +1185,17 @@ class _Frame:
         values = self.proof.bind(
             target, positional, keywords, target.is_bound_method, node, caller=self.function
         )
+        values.update(captures)
         if instance is not None:
             values[instance_binding["implicit_binding"]["parameter"]] = instance
         captured_keywords = values.get(target.signature.kwarg)
         captured_positionals = values.get(target.signature.vararg)
-        if ordinary or _tracked(captured_keywords) or _tracked(captured_positionals):
+        if captured or ordinary or _tracked(captured_keywords) or _tracked(captured_positionals):
             self.proof.note(
                 self.function,
-                "ordinary_container_forwarding"
+                "immediate_capture_forwarding"
+                if captured
+                else "ordinary_container_forwarding"
                 if ordinary
                 else (
                     "forwarded_positional"
@@ -1184,7 +1210,9 @@ class _Frame:
                 expanded = self.proof.context.adapter.expand(self.analysis, facts.id)
             except ResolutionError as exc:
                 self.proof.unknown(self.function, "flow_expansion_failed", str(exc), node)
-            self.proof.run(target, values, analysis=expanded, ancestry=self.ancestry)
+            result = self.proof.run(target, values, analysis=expanded, ancestry=self.ancestry)
+            if captured:
+                return result
         else:
             self.proof.handled(
                 self.function,
@@ -1194,6 +1222,99 @@ class _Frame:
                 target.identity,
             )
         return _Value()
+
+    def capture_values(self, target, call, local, node):
+        """Bind only exact call-time containers of this local source definition."""
+
+        owner = self.function.identity
+        if (
+            not isinstance(local, _LocalFunction)
+            or target.identity.module != owner.module
+            or target.identity.file_path != owner.file_path
+            or target.identity.qualname != owner.qualname + "." + local.node.name
+            or target.node is not local.node
+            or _target_status(self.analysis, call) != "resolved"
+            or call.analysis_status != "analyzed"
+            or call.binding_status != "complete"
+            or call.binding_issues
+            or any(candidate != target.identity for candidate in candidate_identities(call))
+            or any(
+                incoming.get("capture_bindings") != call.capture_bindings
+                for incoming in call.analysis_contexts
+            )
+        ):
+            self.unknown("capture_binding_unproven", node)
+        records = call.capture_bindings
+        names = [item.get("capture") for item in records]
+        if len(names) != len(set(names)) or set(names) != set(
+            capture_names(target.node, self.values)
+        ):
+            self.unknown("capture_binding_unproven", node)
+        values = {}
+        for record in records:
+            name = record["capture"]
+            value = self.values.get(name)
+            shape = (
+                "dict"
+                if isinstance(value, _Keywords)
+                else (value.kind if isinstance(value, _Positionals) else None)
+            )
+            binding = record.get("container_binding", {})
+            roots = record.get("sources", ())
+            contents = record.get("current_sources", ())
+            root = roots[0] if len(roots) == 1 else {}
+            container = root.get("container_object", {}) if root.get("object_only") else root
+            if (
+                shape is None
+                or binding.get("status") != "exact"
+                or binding.get("shape") != shape
+                or binding.get("contents_unknown")
+                or not conditions_possible(self.proof.context, binding)
+                or root.get("kind") not in {"container", "call_result"}
+                or not container.get("source")
+                or container["source"] != binding.get("source")
+                or container.get("container_shape") != shape
+                or root.get("relation") != "direct"
+                or not conditions_possible(self.proof.context, root)
+                or any(
+                    root.get(flag)
+                    for flag in (
+                        "value_incomplete",
+                        "projection",
+                        "output_path",
+                    )
+                )
+                or not any(
+                    Path(witness.get("file_path", "")) == owner.file_path
+                    and all(
+                        witness.get(key) == getattr(node, key)
+                        for key in (
+                            "lineno",
+                            "col_offset",
+                            "end_lineno",
+                            "end_col_offset",
+                        )
+                    )
+                    for witness in binding.get("evidence", ())
+                )
+                or _tracked(value)
+                and not any(
+                    item.get("kind") in {"parameter", "capture"}
+                    and item.get("source") in self.values
+                    and not item.get("object_only")
+                    for item in contents
+                )
+                or any(
+                    item.get("value_incomplete")
+                    or item.get("projection")
+                    or not conditions_possible(self.proof.context, item)
+                    for item in contents
+                )
+            ):
+                self.unknown("capture_binding_unproven", node)
+            # Share the current object, not a copy: modeled pops must reach parent aliases too.
+            values[name] = value
+        return values
 
     def source_callable_binding(self, call, binding):
         if not binding or call.binding_status != "complete" or call.binding_issues:

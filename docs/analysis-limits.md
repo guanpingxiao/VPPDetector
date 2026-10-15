@@ -208,6 +208,14 @@ Dictionary copies keep independent key removal; sequence copies retain element
 order and list/tuple kind. The source witness and copy effects must agree;
 custom containers, constructor rebinding and unknown mutation remain unresolved.
 
+Immediately called local source functions can receive exact call-time captured
+dictionaries and sequences. Each call uses current modeled contents and shares
+container aliases with its enclosing frame; nested calls consume the existing
+depth budget. The selected argument can continue through a returned container.
+Scalar/unknown captures, escaped or rebound local callables, nonlocal writes,
+definition-time calls and deferred async/generator execution remain unresolved.
+Captured slices without exact container facts are not inferred from lexical use.
+
 For finite string-key dictionaries, assessment supports unshadowed built-in
 `set(mapping)`, key-set difference and singleton `list(keys)` projection.
 The selected key is tracked separately from other keys. An established
