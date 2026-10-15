@@ -87,6 +87,15 @@ composition retain boundaries. This does not infer general helper purity.
 
 ### Dispatch and decoration
 
+PCResolve's equality-branch `is` guard facts can select a stable undecorated
+source function for variadic forwarding, including the complement branch of
+`is not`. The consumer preserves the guard and incoming call context; inequality,
+`==`, arbitrary callable predicates and source-unknown attribute lookup do not select
+a target. Open/incomplete callable candidate sets remain boundaries after joins.
+Explicit callable or immutable scalar arguments are retained during helper
+expansion so a known incompatible identity cannot use the generic guarded path.
+These facts describe source-conditioned paths, not unconditional runtime targets.
+
 Classmethod and `__new__` helper forwarding retains source-proven incoming
 receiver contexts. Ordinary helpers retain incoming source-callable bindings
 when PCResolve provides an exact call-edge context.

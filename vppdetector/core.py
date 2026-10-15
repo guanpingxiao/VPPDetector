@@ -320,6 +320,10 @@ def scan_function(
                 if selected and call.target_status == "resolved"
                 else tuple(dict.fromkeys(((selected,) if selected else ()) + candidates))
             )
+            if any(boundary.get("call_id") == call.id
+                   and boundary.get("reason") == "callable_identity_incomplete"
+                   for boundary in analysis.boundaries):
+                targets = ()
             if not targets:
                 boundaries.append(
                     AnalysisBoundary(
@@ -641,7 +645,10 @@ def _expand_body(
             for argument in call.argument_sources
             for value in argument.get("sources", ())
         )
-        if not required and not incoming_callable and not getattr(call, "capture_bindings", ()):
+        incoming_literal = any(argument.get("literal") is not None
+                               for argument in call.argument_sources)
+        if (not required and not incoming_callable and not incoming_literal
+                and not getattr(call, "capture_bindings", ())):
             # Instance-method source candidates and ordinary helpers retain
             # the existing nominal body analysis. Never use this fallback for
             # a missing class receiver context.
