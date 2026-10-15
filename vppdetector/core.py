@@ -1207,7 +1207,7 @@ def _target_definition(
     context: AnalysisContext, target: FunctionIdentity
 ) -> Optional[IndexedFunction]:
     return (
-        context.index.find_by_location(target.file_path, target.lineno)
+        context.index.find_by_location(target.file_path, target.lineno, identity=target)
         if target.file_path and target.lineno
         else context.index.find(target)
     )

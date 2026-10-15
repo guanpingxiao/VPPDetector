@@ -51,6 +51,9 @@ Supported analysis includes:
 - Immediately invoked synchronous source closures with exact call-time captured
   container shapes and current open contents; nested named scopes can relay
   the same capture within the forwarding depth limit.
+- Source-selected lambdas, indexed by their lexical owner and exact line/column
+  identity. Their expression body is exposed as a return-statement view, without
+  compiling or executing it; same-line lambdas remain distinct.
 
 Passing a container as an ordinary argument is a propagation hop, not a
 finding by itself. A finding requires an eventual expansion into a signature
@@ -76,6 +79,11 @@ Missing, conflicting or effect-uncertain facts remain boundaries.
 Complete ordinary-parameter constant-key removal facts can preserve propagation
 through an existing alias. Normal-return effects describe that return path,
 rather than unconditional removal on exception paths.
+Complete same-module helper effects can also preserve returned-object identity
+through bounded finite-key deletion wrappers. Unused direct helper calls must
+resolve to stable undecorated functions with fully bound ordinary-name inputs;
+unknown keys, shadowed targets, unsupported effects and recursive/budget-limited
+composition retain boundaries. This does not infer general helper purity.
 
 ### Dispatch and decoration
 
@@ -130,6 +138,12 @@ materialized input dependencies as independent propagation.
 
 Module names follow the source context's import roots. File/name/line conflicts
 and unavailable implementations remain unresolved rather than guessed.
+Definitions in conditional statement blocks, including class methods in an
+exception handler, retain their lexical source identity. PCResolve records
+`conditional_definition_unconfirmed` with activation conditions; a located
+entry does not prove the branch is active at runtime. Duplicate conditional
+names require an exact location, and constant-inactive definition conditions
+cannot supply a forwarding path.
 
 API-scoped preparation follows explicit imports within the source root.
 Dynamic dependencies are not inferred, so an import closure describes a

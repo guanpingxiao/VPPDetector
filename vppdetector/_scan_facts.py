@@ -155,10 +155,11 @@ def conditions_possible(context, value) -> bool:
         path = Path(witness.get('file_path', ''))
         if path not in context._constant_tests:
             tests = {}
-            for function in context.index.functions:
-                if function.identity.file_path != path:
-                    continue
-                for node in ast.walk(function.node):
+            roots = [function.node for function in context.index.functions
+                     if function.identity.file_path == path]
+            roots.extend(context.index.condition_nodes.get(path, ()))
+            for root in roots:
+                for node in ast.walk(root):
                     if not isinstance(node, (ast.Constant, ast.UnaryOp, ast.BoolOp)):
                         continue
                     truth = _constant_truth(node)

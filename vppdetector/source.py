@@ -71,6 +71,7 @@ class SourceIndex:
     imports: dict = field(default_factory=dict)
     classes: Tuple[FunctionIdentity, ...] = ()
     is_api_scope: bool = False
+    condition_nodes: dict = field(default_factory=dict, repr=False)
     _definition_index: object = field(default=None, init=False, repr=False)
     _location_members: Optional[tuple] = field(default=None, init=False, repr=False, compare=False)
     _function_locations: dict = field(default_factory=dict, init=False, repr=False, compare=False)
@@ -182,15 +183,25 @@ class SourceIndex:
             self._definition_index = DefinitionIndex(records)
         return self._definition_index
 
-    def find_by_location(self, file_path: Path, lineno: int) -> Optional[IndexedFunction]:
+    def find_by_location(
+        self, file_path: Path, lineno: int, *, identity: Optional[FunctionIdentity] = None
+    ) -> Optional[IndexedFunction]:
         """Look up an exact position within this fixed source snapshot."""
 
         self._prepare_locations()
         resolved = file_path.resolve()
         candidates = self._function_locations.get((resolved, lineno), ())
+        if identity is not None:
+            candidates = [function for function in candidates
+                          if function.identity.module == identity.module
+                          and function.identity.qualname == identity.qualname]
         if len(candidates) == 1:
             return candidates[0]
         constructors = self._constructor_locations.get((resolved, lineno), ())
+        if identity is not None:
+            constructors = [function for function in constructors
+                            if function.identity.module == identity.module
+                            and function.identity.qualname.rpartition('.')[0] == identity.qualname]
         return constructors[0] if len(constructors) == 1 else None
 
     def _prepare_locations(self) -> None:
@@ -227,14 +238,41 @@ class _FunctionCollector(ast.NodeVisitor):
         self.functions: List[IndexedFunction] = []
         self.constructors: List[IndexedConstructor] = []
         self.classes: List[FunctionIdentity] = []
+        self.conditions: List[ast.AST] = []
+
+    def visit_If(self, node: ast.If) -> None:
+        self.conditions.append(node.test)
+        self.generic_visit(node)
 
     def generic_visit(self, node: ast.AST) -> None:
-        # Definitions live in statement structure, not inside expressions.
-        # Traversing giant expression trees adds no API facts and can overflow
-        # Python's recursion limit even when the source parses successfully.
+        # Visit statement structure normally and collect expression lambdas
+        # iteratively so giant expression trees cannot overflow this visitor.
         for child in ast.iter_child_nodes(node):
-            if not isinstance(child, ast.expr):
+            if isinstance(child, ast.expr):
+                self._collect_lambdas(child)
+            else:
                 self.visit(child)
+
+    def _collect_lambdas(self, expression: ast.expr) -> None:
+        # An iterative expression walk keeps giant non-lambda expressions safe.
+        pending = [expression]
+        while pending:
+            node = pending.pop()
+            if isinstance(node, ast.Lambda):
+                name = '<lambda>@%s:%s' % (node.lineno, node.col_offset)
+                # A statement view gives existing consumers an exact return body;
+                # identity and all expression/call locations remain from the lambda.
+                returned = ast.copy_location(ast.Return(value=node.body), node.body)
+                view = ast.copy_location(ast.FunctionDef(
+                    name=name, args=node.args, body=[returned], decorator_list=[],
+                    returns=None, type_comment=None,
+                ), node)
+                self.functions.append(IndexedFunction(
+                    FunctionIdentity(self.module, '.'.join((*self.scope, name)),
+                                     self.file_path, node.lineno),
+                    SignatureFacts.from_arguments(node.args), view, False,
+                ))
+            pending.extend(ast.iter_child_nodes(node))
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         class_qualname = ".".join((*self.scope, node.name))
@@ -360,6 +398,7 @@ def build_source_index(
     classes: List[FunctionIdentity] = []
     boundaries: List[AnalysisBoundary] = []
     imports = {}
+    condition_nodes = {}
 
     while pending:
         file_path = pending.pop()
@@ -436,6 +475,7 @@ def build_source_index(
         functions.extend(collector.functions)
         constructors.extend(collector.constructors)
         classes.extend(collector.classes)
+        condition_nodes[file_path] = tuple(collector.conditions)
 
     return SourceIndex(
         source=normalized_source,
@@ -453,6 +493,7 @@ def build_source_index(
         imports=imports,
         classes=tuple(sorted(classes, key=lambda item: (str(item.file_path), item.lineno))),
         is_api_scope=is_api_scope,
+        condition_nodes=condition_nodes,
     )
 
 
